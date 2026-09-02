@@ -47,6 +47,7 @@ jobs:
             automake \
             build-essential \
             clang-18 \
+            cmake \
             curl \
             git \
             libarchive-tools \
@@ -56,6 +57,8 @@ jobs:
             meson \
             pacman-package-manager \
             pkg-config \
+            python3 \
+            python3-yaml \
             xxd \
             zip
 
@@ -65,11 +68,46 @@ jobs:
           makepkg -c -f
           sudo pacman --noconfirm -U ./ps5-payload-*.pkg.tar.gz
 
+      - name: Build PS5 openlibm package
+        working-directory: pacbrew-repo/openlibm
+        run: |
+          makepkg -c -f
+          sudo pacman --noconfirm -U ./ps5-payload-*.pkg.tar.gz
+
+      - name: Build PS5 json-c package
+        working-directory: pacbrew-repo/json-c
+        run: |
+          makepkg -c -f
+          sudo pacman --noconfirm -U ./ps5-payload-*.pkg.tar.gz
+
+      - name: Build PS5 zlib package
+        working-directory: pacbrew-repo/zlib
+        run: |
+          makepkg -c -f
+          sudo pacman --noconfirm -U ./ps5-payload-*.pkg.tar.gz
+
+      - name: Build PS5 libpng package
+        working-directory: pacbrew-repo/libpng
+        run: |
+          makepkg -c -f
+          sudo pacman --noconfirm -U ./ps5-payload-*.pkg.tar.gz
+
+      - name: Build PS5 libmicrohttpd package
+        working-directory: pacbrew-repo/libmicrohttpd
+        run: |
+          makepkg -c -f
+          sudo pacman --noconfirm -U ./ps5-payload-*.pkg.tar.gz
+
       - name: Build PS5 sqlite package
         working-directory: pacbrew-repo/sqlite
         run: |
           makepkg -c -f
           sudo pacman --noconfirm -U ./ps5-payload-*.pkg.tar.gz
+
+      - name: Check API tools and manifest
+        run: |
+          python3 -m py_compile tools/api_test.py
+          python3 -c 'import pathlib, yaml; yaml.safe_load(pathlib.Path("docs/openapi.yaml").read_text(encoding="utf-8"))'
 
       - name: Build payload
         run: |

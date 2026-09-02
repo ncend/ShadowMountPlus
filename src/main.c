@@ -1,13 +1,21 @@
 #include "sm_platform.h"
 
+#include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <netinet/in.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <sys/socket.h>
 #include <sys/sysctl.h>
 
 #include "sm_runtime.h"
+#include "sm_ampr_updater.h"
+#include "sm_api_service.h"
 #include "sm_types.h"
 #include "sm_log.h"
 #include "sm_shellcore_flags.h"
+#include "sm_shellcore_hooks.h"
+#include "sm_shellcore_service.h"
 #include "sm_config_mount.h"
 #include "sm_game_lifecycle.h"
 #include "sm_kstuff.h"
@@ -28,6 +36,10 @@
 #define SHADOWMOUNT_VERSION "unknown"
 #endif
 
+#ifndef SHADOWMOUNT_BUILD_TIME
+#define SHADOWMOUNT_BUILD_TIME __DATE__ " " __TIME__
+#endif
+
 #define PAYLOAD_NAME "shadowmountplus.elf"
 #define BACKPORK_PROCESS_NAME "backpork.elf"
 #define BACKPORK_PROCESS_NAME_ALT "ps5-backpork.elf"
@@ -44,6 +56,7 @@
 static volatile sig_atomic_t g_stop_requested = 0;
 static atomic_bool g_shutdown_on_going_stop_requested = false;
 static atomic_bool g_runtime_sleep_mode_active = false;
+static atomic_uint_fast64_t g_runtime_resume_grace_deadline_us = 0;
 static _Atomic(uintptr_t) g_shutdown_stop_reason_bits = 0;
 static atomic_uint_fast64_t g_next_stop_file_poll_us = 0;
 static pthread_mutex_t g_runtime_mount_state_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -51,6 +64,7 @@ static pthread_mutex_t g_runtime_mount_state_mutex = PTHREAD_MUTEX_INITIALIZER;
 typedef struct {
   pthread_mutex_t reason_mutex;
   char reason[128];
+  bool reset_attempts;
 } immediate_scan_request_t;
 
 static immediate_scan_request_t g_scan_now = {
@@ -60,6 +74,35 @@ static immediate_scan_request_t g_scan_now = {
 
 extern unsigned char config_ini_example[];
 extern unsigned int config_ini_example_len;
+
+static void resolve_web_interface_address(const char *bind_address,
+                                          char *address,
+                                          size_t address_size) {
+  (void)strlcpy(address, bind_address, address_size);
+  if (strcmp(bind_address, "0.0.0.0") != 0)
+    return;
+
+  struct ifaddrs *ifaddr = NULL;
+  if (getifaddrs(&ifaddr) != 0)
+    return;
+
+  for (const struct ifaddrs *ifa = ifaddr; ifa != NULL;
+       ifa = ifa->ifa_next) {
+    if (ifa->ifa_addr == NULL || ifa->ifa_addr->sa_family != AF_INET ||
+        strncmp(ifa->ifa_name, "lo", 2) == 0)
+      continue;
+
+    const struct sockaddr_in *in =
+        (const struct sockaddr_in *)ifa->ifa_addr;
+    if (inet_ntop(AF_INET, &in->sin_addr, address, address_size) != NULL &&
+        strncmp(address, "0.", 2) != 0)
+      break;
+
+    (void)strlcpy(address, bind_address, address_size);
+  }
+
+  freeifaddrs(ifaddr);
+}
 
 static void on_signal(int sig) {
   (void)sig;
@@ -77,6 +120,8 @@ void install_signal_handlers(void) {
   sigaction(SIGHUP, &sa, NULL);
   sigaction(SIGQUIT, &sa, NULL);
   sigaction(SIGABRT, &sa, NULL);
+  sa.sa_handler = SIG_IGN;
+  sigaction(SIGPIPE, &sa, NULL);
 }
 
 bool should_stop_requested(void) {
@@ -126,25 +171,52 @@ bool runtime_sleep_mode_active(void) {
                               memory_order_acquire);
 }
 
+bool runtime_resume_grace_active(void) {
+  uint64_t deadline_us = atomic_load_explicit(
+      &g_runtime_resume_grace_deadline_us, memory_order_acquire);
+  uint64_t now_us = monotonic_time_us();
+  return deadline_us != 0 && now_us != 0 && now_us < deadline_us;
+}
+
 static void clear_scan_now_request(void) {
   pthread_mutex_lock(&g_scan_now.reason_mutex);
   g_scan_now.reason[0] = '\0';
+  g_scan_now.reset_attempts = false;
   pthread_mutex_unlock(&g_scan_now.reason_mutex);
 }
 
 bool request_runtime_sleep_mode(bool active, const char *reason) {
-  bool previous = atomic_exchange_explicit(&g_runtime_sleep_mode_active, active,
-                                           memory_order_acq_rel);
-  if (previous == active)
-    return false;
-
-  if (active)
+  if (active) {
+    bool previous = atomic_exchange_explicit(&g_runtime_sleep_mode_active, true,
+                                             memory_order_acq_rel);
+    if (previous)
+      return false;
     clear_scan_now_request();
+    atomic_store_explicit(&g_runtime_resume_grace_deadline_us, 0,
+                          memory_order_release);
+  } else {
+    if (!runtime_sleep_mode_active())
+      return false;
+    uint64_t now_us = monotonic_time_us();
+    uint64_t deadline_us =
+        now_us != 0 ? now_us + RUNTIME_RESUME_GRACE_US : 0;
+    // Publish the deadline before allowing launch requests to observe that
+    // sleep mode ended.
+    atomic_store_explicit(&g_runtime_resume_grace_deadline_us, deadline_us,
+                          memory_order_release);
+    bool previous = atomic_exchange_explicit(&g_runtime_sleep_mode_active,
+                                             false, memory_order_acq_rel);
+    if (!previous)
+      return false;
+  }
 
   const char *resolved_reason =
       (reason && reason[0] != '\0') ? reason : "unknown sleep source";
   log_debug("[SLEEP] %s by %s", active ? "entered" : "left",
             resolved_reason);
+  sm_api_service_on_sleep_change(active);
+  sm_shellcore_service_on_sleep_change(active);
+  sm_ampr_updater_on_sleep_change(active);
   sm_scanner_wake();
   wake_game_lifecycle_watcher();
   return true;
@@ -159,23 +231,26 @@ void runtime_mount_state_unlock(void) {
 }
 
 void request_scan_now(const char *reason) {
+  request_scan_now_with_options(reason, false);
+}
+
+void request_scan_now_with_options(const char *reason, bool reset_attempts) {
   const char *resolved_reason =
       (reason && reason[0] != '\0') ? reason : "unknown scan source";
-  bool resume_scan =
-      strcmp(resolved_reason, "SceSystemStateMgrInfo=WORKING") == 0;
-  if (runtime_sleep_mode_active() && !resume_scan)
+  if (runtime_sleep_mode_active())
     return;
 
   char log_reason[sizeof(g_scan_now.reason)];
-  bool should_log = !resume_scan;
+  bool should_log = false;
 
   pthread_mutex_lock(&g_scan_now.reason_mutex);
   if (g_scan_now.reason[0] == '\0') {
     (void)strlcpy(g_scan_now.reason, resolved_reason, sizeof(g_scan_now.reason));
     (void)strlcpy(log_reason, g_scan_now.reason, sizeof(log_reason));
-  } else {
-    should_log = false;
+    should_log = true;
   }
+  if (reset_attempts)
+    g_scan_now.reset_attempts = true;
   pthread_mutex_unlock(&g_scan_now.reason_mutex);
 
   if (should_log)
@@ -183,9 +258,12 @@ void request_scan_now(const char *reason) {
   sm_scanner_wake();
 }
 
-bool consume_scan_now_request(char *reason_out, size_t reason_out_size) {
+bool consume_scan_now_request(char *reason_out, size_t reason_out_size,
+                              bool *reset_attempts_out) {
   if (reason_out && reason_out_size > 0)
     reason_out[0] = '\0';
+  if (reset_attempts_out)
+    *reset_attempts_out = false;
   pthread_mutex_lock(&g_scan_now.reason_mutex);
   if (g_scan_now.reason[0] == '\0') {
     pthread_mutex_unlock(&g_scan_now.reason_mutex);
@@ -193,7 +271,10 @@ bool consume_scan_now_request(char *reason_out, size_t reason_out_size) {
   }
   if (reason_out && reason_out_size > 0)
     (void)strlcpy(reason_out, g_scan_now.reason, reason_out_size);
+  if (reset_attempts_out)
+    *reset_attempts_out = g_scan_now.reset_attempts;
   g_scan_now.reason[0] = '\0';
+  g_scan_now.reset_attempts = false;
   pthread_mutex_unlock(&g_scan_now.reason_mutex);
   return true;
 }
@@ -250,12 +331,23 @@ pid_t find_pid_by_name(const char *name, bool exclude_self) {
   pid_t found_pid = 0;
   uint8_t *ptr = buf;
   uint8_t *end = buf + buf_size;
-  while (ptr < end) {
-    int ki_structsize = *(int *)ptr;
-    pid_t ki_pid = *(pid_t *)&ptr[KINFO_PID_OFFSET];
+  while ((size_t)(end - ptr) >= sizeof(int)) {
+    int ki_structsize = 0;
+    memcpy(&ki_structsize, ptr, sizeof(ki_structsize));
+    if (ki_structsize <= KINFO_TDNAME_OFFSET ||
+        (size_t)ki_structsize > (size_t)(end - ptr)) {
+      found_pid = -1;
+      break;
+    }
+
+    pid_t ki_pid = 0;
+    memcpy(&ki_pid, &ptr[KINFO_PID_OFFSET], sizeof(ki_pid));
     const char *ki_tdname = (const char *)&ptr[KINFO_TDNAME_OFFSET];
+    size_t tdname_size = (size_t)ki_structsize - KINFO_TDNAME_OFFSET;
     ptr += ki_structsize;
-    if ((!exclude_self || ki_pid != mypid) && strcmp(ki_tdname, name) == 0) {
+    if ((!exclude_self || ki_pid != mypid) &&
+        strnlen(ki_tdname, tdname_size) < tdname_size &&
+        strcmp(ki_tdname, name) == 0) {
       found_pid = ki_pid;
       break;
     }
@@ -321,20 +413,21 @@ static void log_non_empty_scan_paths(void) {
   }
 }
 
-static void ensure_kstuff_noautomount_file(void) {
+static bool ensure_kstuff_noautomount_file(void) {
   if (path_exists(KSTUFF_NOAUTOMOUNT_FILE))
-    return;
+    return true;
 
-  int fd = open(KSTUFF_NOAUTOMOUNT_FILE, O_RDONLY | O_CREAT, 0666);
-  if (fd >= 0) {
-    close(fd);
-    printf("[KSTUFF] Created startup sentinel: %s\n",
-           KSTUFF_NOAUTOMOUNT_FILE);
-    return;
+  int fd = open(KSTUFF_NOAUTOMOUNT_FILE, O_WRONLY | O_CREAT, 0666);
+  if (fd < 0) {
+    printf("[KSTUFF] Failed to create %s: %s\n", KSTUFF_NOAUTOMOUNT_FILE,
+           strerror(errno));
+    return false;
   }
+  (void)close(fd);
 
-  printf("[KSTUFF] Failed to create %s: %s\n", KSTUFF_NOAUTOMOUNT_FILE,
-         strerror(errno));
+  printf("[KSTUFF] Created automount sentinel: %s\n",
+         KSTUFF_NOAUTOMOUNT_FILE);
+  return true;
 }
 
 static bool write_buffer_to_fd(int fd, const unsigned char *buf, size_t size) {
@@ -381,7 +474,19 @@ static void ensure_runtime_config_file(void) {
   printf("[CFG] Created default config from template: %s\n", CONFIG_FILE);
 }
 
-static void cleanup_kstuff_noautomount_files(void) {
+static void cleanup_kstuff_noautomount_file(void) {
+  pid_t replacement_pid = find_pid_by_name(PAYLOAD_NAME, true);
+  if (replacement_pid > 0) {
+    log_debug("[KSTUFF] replacement instance pid=%ld; keeping %s",
+              (long)replacement_pid, KSTUFF_NOAUTOMOUNT_FILE);
+    return;
+  }
+  if (replacement_pid < 0) {
+    log_debug("[KSTUFF] process enumeration unavailable; keeping %s",
+              KSTUFF_NOAUTOMOUNT_FILE);
+    return;
+  }
+
   if (unlink(KSTUFF_NOAUTOMOUNT_FILE) == 0) {
     log_debug("[KSTUFF] removed shutdown sentinel: %s",
               KSTUFF_NOAUTOMOUNT_FILE);
@@ -428,20 +533,30 @@ int main(void) {
 
   mkdir(LOG_DIR, 0777);
   ensure_runtime_config_file();
-  ensure_kstuff_noautomount_file();
   existing_pid = find_pid_by_name(PAYLOAD_NAME, true);
   if (existing_pid < 0) {
     printf("[RESTART] Failed to enumerate running processes.\n");
     sceUserServiceTerminate();
     return 1;
   }
+  if (!ensure_kstuff_noautomount_file()) {
+    sceUserServiceTerminate();
+    return 1;
+  }
   if (existing_pid > 0) {
     printf("[RESTART] Another instance is already running.\n");
     if (!wait_for_existing_instance_exit(existing_pid)) {
+      printf("[KSTUFF] Keeping automount sentinel after failed handoff.\n");
       sceUserServiceTerminate();
       return 0;
     }
     restarted_previous_instance = true;
+  }
+  // Older builds removed the sentinel unconditionally during shutdown.
+  // Recreate it after handoff before starting any mount work.
+  if (!ensure_kstuff_noautomount_file()) {
+    sceUserServiceTerminate();
+    return 1;
   }
   syscall(SYS_thr_set_name, -1, PAYLOAD_NAME);
 
@@ -461,20 +576,30 @@ int main(void) {
   log_debug(
       "ShadowMount+ v%s exFAT/UFS/PFS/LVD/MD. "
       "FW: %s. "
-      "Build: %s %s. "
+      "Build: %s. "
       "Thx to VoidWhisper/Gezine/Earthonion/EchoStretch/Drakmor",
-      SHADOWMOUNT_VERSION, firmware_version, __DATE__, __TIME__);
+      SHADOWMOUNT_VERSION, firmware_version, SHADOWMOUNT_BUILD_TIME);
   if (restarted_previous_instance)
     log_debug("[RESTART] Previous instance stopped, continuing startup");
   load_runtime_config();
   sm_notifications_init();
   stop_conflicting_backpork();
-  if (!sm_shellcore_flags_start())
-    log_debug("  [SHELLFLAG] monitor unavailable");
   sm_mdbg_init();
   sm_kstuff_init();
+  if (!sm_shellcore_service_start())
+    log_debug("  [SHELLCORE] Unix socket service unavailable: %s",
+              strerror(errno));
+  else if (!sm_shellcore_hooks_start()) {
+    log_debug("  [SHELLCORE] lifecycle hooks unavailable; stock behavior kept");
+    notify_system_l10n(SM_L10N_SHELLCORE_HOOKS_FAILED);
+  }
   if (!refresh_game_lifecycle_watcher())
     log_debug("  [GAME] lifecycle watcher unavailable");
+  // Publish the initial AppFocus only after its lifecycle/kstuff consumers.
+  if (!sm_shellcore_flags_start())
+    log_debug("  [SHELLFLAG] monitor unavailable");
+  if (!sm_ampr_updater_start())
+    log_debug("  [AMPR] update service unavailable: %s", strerror(errno));
 
   if (mkdir("/system_ex/app", 0777) != 0 && errno != EEXIST) {
     log_debug("  [MOUNT] failed to create /system_ex/app: %s", strerror(errno));
@@ -483,14 +608,23 @@ int main(void) {
     log_debug("  [MOUNT] remount_system_ex failed: %s", strerror(errno));
   }
 
-  notify_system("ShadowMount+ v%s exFAT/UFS/PFS", SHADOWMOUNT_VERSION);
+  const runtime_config_t *startup_cfg = runtime_config();
+  if (startup_cfg->api_enabled) {
+    char web_address[MAX_API_BIND_ADDRESS];
+    resolve_web_interface_address(startup_cfg->api_bind_address, web_address,
+                                  sizeof(web_address));
+    notify_system_l10n(SM_L10N_STARTUP_WEB, SHADOWMOUNT_VERSION,
+                       web_address, startup_cfg->api_port);
+  } else {
+    notify_system_l10n(SM_L10N_STARTUP, SHADOWMOUNT_VERSION);
+  }
   log_non_empty_scan_paths();
 
   if (runtime_config()->legacy_recursive_scan_forced) {
-    notify_system_info("ShadowMount+: recursive_scan=1 deprecated, using scan_depth=2.");
+    notify_system_info_l10n(SM_L10N_RECURSIVE_SCAN_DEPRECATED);
   } else if (runtime_config()->scan_depth > 1u) {
-    notify_system_info("ShadowMount+: scan depth %u enabled.",
-                       runtime_config()->scan_depth);
+    notify_system_info_l10n(SM_L10N_SCAN_DEPTH_ENABLED,
+                            runtime_config()->scan_depth);
   }
 
   cleanup_mount_dirs();
@@ -500,9 +634,11 @@ int main(void) {
   }
 
   log_debug("[STARTUP] cleanup_staged_mount_links begin");
+  runtime_mount_state_lock();
   cleanup_staged_mount_links();
   log_debug("[STARTUP] cleanup_duplicate_title_mounts begin");
   cleanup_duplicate_title_mounts();
+  runtime_mount_state_unlock();
   if (!app_db_run_startup_maintenance())
     log_debug("  [DB] startup snd0info maintenance unavailable");
   log_debug("[STARTUP] scanner startup sync begin");
@@ -511,18 +647,35 @@ int main(void) {
     goto shutdown;
   }
   log_debug("[STARTUP] scanner startup sync done");
+  if (!sm_api_service_start())
+    log_debug("  [API] HTTP/JSON service unavailable: %s", strerror(errno));
   sm_scanner_run_loop();
 
 shutdown:
+  sm_ampr_updater_stop();
+  sm_api_service_stop();
+  // Stop ShellCore producers before their lifecycle and mount-state owners.
   sm_shellcore_flags_stop();
+  sm_shellcore_hooks_stop();
   stop_game_lifecycle_watcher();
+  sm_shellcore_service_stop();
   sm_scanner_shutdown();
   sm_kstuff_shutdown();
   sm_mdbg_shutdown();
-  cleanup_kstuff_noautomount_files();
-  shutdown_title_mounts();
-  if (!shutdown_image_mounts()) {
+  bool title_mounts_released = shutdown_title_mounts();
+  bool image_mounts_released = false;
+  if (title_mounts_released) {
+    image_mounts_released = shutdown_image_mounts();
+  } else {
+    log_debug("[SHUTDOWN] image teardown skipped while title layers remain");
+  }
+  if (!image_mounts_released) {
     log_debug("[SHUTDOWN] some image mounts or devices were not fully released");
+  }
+  if (title_mounts_released && image_mounts_released) {
+    cleanup_kstuff_noautomount_file();
+  } else {
+    log_debug("[KSTUFF] keeping automount disabled after incomplete teardown");
   }
   shutdown_app_db();
 

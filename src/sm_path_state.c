@@ -17,6 +17,7 @@ struct PathStateEntry {
   bool game_info_cached;
   bool game_info_valid;
   time_t game_info_mtime;
+  long game_info_mtime_nsec;
   off_t game_info_size;
   ino_t game_info_ino;
   char game_title_id[MAX_TITLE_ID];
@@ -129,6 +130,7 @@ bool load_cached_game_info(const char *path, const struct stat *param_st,
   struct PathStateEntry *entry = find_path_state(path);
   if (!entry || !entry->game_info_cached ||
       entry->game_info_mtime != param_st->st_mtime ||
+      entry->game_info_mtime_nsec != param_st->st_mtim.tv_nsec ||
       entry->game_info_size != param_st->st_size ||
       entry->game_info_ino != param_st->st_ino) {
     return false;
@@ -150,6 +152,7 @@ void store_cached_game_info(const char *path, const struct stat *param_st,
   entry->game_info_cached = true;
   entry->game_info_valid = valid;
   entry->game_info_mtime = param_st->st_mtime;
+  entry->game_info_mtime_nsec = param_st->st_mtim.tv_nsec;
   entry->game_info_size = param_st->st_size;
   entry->game_info_ino = param_st->st_ino;
   (void)strlcpy(entry->game_title_id, valid ? title_id : "", MAX_TITLE_ID);
@@ -214,7 +217,7 @@ void record_missing_param_failure(const char *path) {
 
   log_debug("  [SCAN] missing/invalid param.json: %s", path);
   if (entry->missing_param_attempts == 1)
-    notify_system("Missing/invalid param.json:\n%s", path);
+    notify_system_l10n(SM_L10N_MISSING_PARAM, path);
   if (entry->missing_param_attempts >= MAX_MISSING_PARAM_SCAN_ATTEMPTS &&
       !entry->missing_param_limit_logged) {
     log_debug("  [SCAN] attempt limit reached (%u), skipping path: %s",
@@ -257,6 +260,19 @@ void clear_image_mount_attempts(const char *path) {
     return;
   entry->image_mount_attempts = 0;
   entry->image_mount_limit_logged = false;
+}
+
+size_t reset_all_image_mount_attempts(void) {
+  size_t reset_count = 0;
+  for (int k = 0; k < PATH_STATE_CAPACITY; k++) {
+    struct PathStateEntry *entry = &g_path_state[k];
+    if (!entry->valid || entry->image_mount_attempts == 0)
+      continue;
+    entry->image_mount_attempts = 0;
+    entry->image_mount_limit_logged = false;
+    reset_count++;
+  }
+  return reset_count;
 }
 
 bool is_backport_mount_blocked(const char *path) {

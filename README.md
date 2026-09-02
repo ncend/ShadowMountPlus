@@ -54,25 +54,38 @@ This file is optional. If it does not exist, ShadowMountPlus creates it from the
 Supported keys (all optional):
 - `debug=1|0` (`1` enables `log_debug` output to console + `/data/shadowmount/debug.log`; default is `1`)
 - `quiet_mode=1|0` (`1` suppresses plain informational popups but keeps rich toasts; default is `0`)
+- `language=auto|<locale>` (notification language; `auto` uses the console system language, e.g. `en-US`, `ru-RU`; default: `auto`)
+- `api_bind_address=<IPv4>` (HTTP/JSON API bind address; default: `127.0.0.1`; use `0.0.0.0` for network access)
+- `api_port=<1..65535>` (HTTP/JSON API port; default: `10101`)
 - `mount_read_only=1|0` (default: `1`)
 - `force_mount=1|0` (mounting even damaged file systems; default: `0`)
-- `app_install_all=1|0` (`1` stages new titles and submits them through `sceAppInstUtilAppInstallAll`; default: `0` on FW below `12.00`, forced `1` on FW `12.00+`)
+- `persistent_image_mounts=1|0` (`1` keeps discovered images mounted between game launches; default: `0`)
+- `app_install_all=1|0` (`1` stages new titles and submits them through the stock batch `sceAppInstUtilAppInstallAll`; default: `0` on every firmware. On FW `12.00+`, the default per-title path is provided by the SceShellCore TitleDir bridge.)
+- `auto_remove_missing_games=1|0` (`1` automatically removes games from the system library when their source is no longer available; default: `0`)
+- `auto_remove_games_with_dlc=1|0` (`1` allows automatic removal of games that have installed DLC; default: `0`)
+- `auto_remove_missing_delay_seconds=<1..86400>` (how long a source must remain unavailable before removal; default: `300`)
 - `image_ro=<image_filename>` (repeatable; force read-only mode for this image filename)
 - `image_rw=<image_filename>` (repeatable; force read-write mode for this image filename)
-- `image_sector=<image_filename>:<sector_size>` (repeatable; force sector size for this image filename)
+- `image_sector=<image_filename>:<sector_size>` (repeatable; force the logical device sector size, not the filesystem cluster size)
 - `scan_depth=<1..2>` (`1` = scan only first-level subfolders, `2` = also scan one additional nested level; default: `1`)
 - `recursive_scan=1|0` (deprecated compatibility key; `1` forces `scan_depth=2`)
 - `scan_interval_seconds=<1..3600>` (full scan loop interval; default: `15`)
 - `stability_wait_seconds=<0..3600>` (minimum source age before processing; default: `10`)
 - `exfat_backend=lvd|md` (default: `lvd`)
 - `ufs_backend=lvd|md` (default: `lvd`)
+- `nested_pfs_index_cache=1|0` (request the containing PFS compressed-file index cache before attaching a nested image; default: `0`)
 - `backport_fakelib=1|0` (`1` mounts sandbox `fakelib` overlays for running games; default: `1`)
-- `global_fakelib=1|0` (`1` enables the global fakelib overlay when the folder exists; default: `1`)
+- `update_emulators=1|0` (`1` updates all emulators with matching files in a game's own fakelib; `fakelib2` is excluded; default: `1`)
+- `emulators_path=<absolute_path>` (folder containing emulator update files; default: `/data/shadowmount/emus`)
+- `auto_update_ampr=1|0` (check for a new `libSceAmpr.sprx` 30 seconds after startup and every four hours; default: `0`)
+- `ampr_update_url=<http_or_https_url>` (AMPR emulator download URL; default: `https://github.com/drakmor/ampr_emu/releases/latest/download/libSceAmpr.sprx`)
+- `global_fakelib=1|0` (`1` enables the global fakelib overlay when the folder exists; `fakelib2` remains exclusive; default: `1`)
 - `global_fakelib_path=<absolute_path>` (global fakelib folder; default: `/data/shadowmount/fakelib`)
 - `global_fakelib_priority=game|global` (overlay priority when both global and game fakelib exist; default: `game`)
 - `global_fakelib_exclude=<TITLE_ID>` (repeatable; disables the global fakelib overlay for matching titles)
 - `kstuff_game_auto_toggle=1|0` (`1` pauses kstuff after tracked game launches and resumes it on stop; default: `1`)
 - `kstuff_crash_detection=1|0` (`1` enables crash monitoring and pause-delay autotune updates; default: `1`)
+- `fan_target_temperature=system|<50..91>` (automatic fan-controller target in degrees Celsius, applied when a game starts; `system` leaves fan control to the console and is the default)
 - `kstuff_pause_delay_image_seconds=<0..3600>` (delay before pausing kstuff for image-backed launches; default: `25`)
 - `kstuff_pause_delay_direct_seconds=<0..3600>` (delay before pausing kstuff for direct/non-image launches; default: `15`)
 - `kstuff_no_pause=<TITLE_ID>` (repeatable; keeps kstuff enabled for matching titles)
@@ -84,9 +97,48 @@ Supported keys (all optional):
 - `scanpath=<absolute_path>` (can be repeated on multiple lines; default: built-in scan path list below)
 - `lvd_exfat_sector_size=<value>` (default: `512`)
 - `lvd_ufs_sector_size=<value>` (default: `4096`)
-- `lvd_pfs_sector_size=<value>` (default: `32768`)
+- `lvd_pfs_sector_size=<value>` (default: `4096`; the optimized profile uses a `65536`-byte LVD mapping unit)
 - `md_exfat_sector_size=<value>` (default: `512`)
-- `md_ufs_sector_size=<value>` (default: `512`)
+- `md_ufs_sector_size=<value>` (default: `4096`)
+
+Supported notification languages:
+
+| Language | Locale |
+| --- | --- |
+| Arabic (Saudi Arabia) | `ar-SA` |
+| Chinese (Simplified) | `zh-CN` |
+| Chinese (Traditional) | `zh-TW` |
+| Czech | `cs-CZ` |
+| Danish | `da-DK` |
+| Dutch | `nl-NL` |
+| English (United Kingdom) | `en-GB` |
+| English (United States) | `en-US` |
+| Finnish | `fi-FI` |
+| French (Canada) | `fr-CA` |
+| French (France) | `fr-FR` |
+| German | `de-DE` |
+| Greek | `el-GR` |
+| Hungarian | `hu-HU` |
+| Indonesian | `id-ID` |
+| Italian | `it-IT` |
+| Japanese | `ja-JP` |
+| Korean | `ko-KR` |
+| Norwegian | `no-NO` |
+| Polish | `pl-PL` |
+| Portuguese (Brazil) | `pt-BR` |
+| Portuguese (Portugal) | `pt-PT` |
+| Romanian | `ro-RO` |
+| Russian | `ru-RU` |
+| Spanish (Mexico) | `es-MX` |
+| Spanish (Spain) | `es-ES` |
+| Swedish | `sv-SE` |
+| Thai | `th-TH` |
+| Turkish | `tr-TR` |
+| Ukrainian | `uk-UA` |
+| Vietnamese | `vi-VN` |
+
+The public API routes and JSON schemas are documented in [docs/socket-api.md](docs/socket-api.md)
+and available as an [OpenAPI manifest](docs/openapi.yaml).
 
 Per-image mode override behavior:
 - Match is done by image file name (without path).
@@ -99,14 +151,21 @@ mount_read_only=1
 image_rw=PPSA1234-my-image.ffpfs
 image_rw=MYGame 123.exfat
 image_ro=legacy_dump.ffpkg
-image_sector=MYGame 123.exfat:65536
+image_sector=legacy-512-sector.exfat:512
 ```
+
+Persistent image mount behavior:
+- With `persistent_image_mounts=0` (default), backing images are mounted when a game starts and released after it exits.
+- With `persistent_image_mounts=1`, images discovered during scans remain mounted between launches. Per-title runtime and backport layers are still mounted only when needed.
+- USB-backed images are always released during suspend and mounted again by the resume scan.
+- Persistent mode consumes one backing device per mounted image layer and is intended for libraries that fit the available LVD/MD device capacity.
 
 Per-image sector override behavior:
 - Match is done by image file name (without path).
 - `image_sector` in `/data/shadowmount/autotune.ini` has the highest priority for matching image files.
 - If no per-image rule matches, the backend-specific global sector size defaults are used.
 - When image validation fails because the mounted file-system cluster size is smaller than the selected device sector size, ShadowMountPlus writes `image_sector=<image_filename>:<cluster_size>` into `/data/shadowmount/autotune.ini` and asks you to try mounting again.
+- For the exFAT LVD/BFS fast path, leave the logical sector at its default `512`. The required `65536` values are the exFAT allocation unit and the internal LVD `secondary_unit`; do not set `image_sector=...:65536` to request this mode.
 
 Scan path behavior:
 - If at least one `scanpath=...` is present, only those custom paths are used.
@@ -116,6 +175,7 @@ Scan path behavior:
 - If `recursive_scan=1` is set, ShadowMount+ forces `scan_depth=2`.
 - Full scan loop runs every `scan_interval_seconds` (default: `15`).
 - Sources newer than `stability_wait_seconds` are deferred until stable (default: `10`).
+- With `auto_remove_missing_games=1`, a game is removed from the system library only after its source remains unavailable for `auto_remove_missing_delay_seconds`. If the source becomes available again before removal, the pending removal is cancelled.
 - Direct folder installs use `<game>/sce_sys` for this check; image and backport sources use the target path itself.
 
 Backport overlay behavior:
@@ -124,12 +184,13 @@ Backport overlay behavior:
 - The `backports` folder is ignored during normal game scanning.
 - A backport is applied automatically to the matching mounted game from any configured scan path.
 - If multiple scan paths provide the same title backport, the game's own scan path wins; otherwise scan path order is used.
-- If `/mnt/sandbox/<TITLE_ID>_XXX/app0/fakelib2` exists while the game is running, ShadowMount+ mounts it into that game's sandbox `common/lib`; otherwise it falls back to `app0/fakelib`.
-- If `global_fakelib=1` and `global_fakelib_path` exists as a directory, ShadowMount+ also mounts that folder into the same sandbox `common/lib`.
-- When both global and per-game fakelib exist, the default gives the game's own `fakelib` priority by mounting `/data/shadowmount/fakelib` first and then the game-specific fakelib.
-- `global_fakelib_priority=global` reverses that priority.
+- ShadowMount+ checks the selected backport for `fakelib2` and then `fakelib`; if neither exists, it uses only `fakelib` from the original game source. The selected directory is mounted into the running game's sandbox `common/lib`. A backport `fakelib2` is always mounted directly and exclusively: neither emulator updates nor the global fakelib can replace or supplement it.
+- If `update_emulators=1`, matching files from `emulators_path` replace files in the selected game fakelib, except when `fakelib2` is selected. The cache is refreshed when its sources change and expires after seven days without a game launch.
+- With `auto_update_ampr=1`, ShadowMount+ checks for AMPR updates 30 seconds after startup and every four hours. It downloads a missing or newer emulator and displays a notification after a successful update.
+- The backport notification adds `Emulators updated` when emulator files are updated for the launched game.
+- If both global and per-game fakelib exist, they are combined in the game cache according to `global_fakelib_priority`, unless the selected backport contains `fakelib2`. Without a per-game fakelib, the global folder is mounted directly.
 - Use repeatable `global_fakelib_exclude=<TITLE_ID>` entries to skip the global fakelib for specific games without disabling per-game fakelib.
-- `backport_fakelib=0` disables the sandbox `fakelib` watcher, including global fakelib.
+- `backport_fakelib=0` disables the sandbox `fakelib` watcher, including global fakelib and emulator updates.
 - For `backport_fakelib` to work correctly, the standalone `BackPork` payload must be disabled. Running both at the same time will conflict.
 
 Kstuff game lifecycle behavior:
@@ -147,7 +208,7 @@ Kstuff game lifecycle behavior:
   - `direct=<seconds>`
   - `image=<seconds>`
 - If both kinds of rule target the same title, `kstuff_no_pause` takes priority.
-- When crash monitoring detects an app crash before kstuff was paused, ShadowMountPlus only notifies that the app crashed and kstuff is not to blame.
+- When crash monitoring detects an app crash before kstuff was paused, ShadowMountPlus only notifies that the app crashed.
 - When crash monitoring detects an app crash within 2 minutes after kstuff auto-pause, ShadowMountPlus doubles the applied pause delay for that title and upserts it into `/data/shadowmount/autotune.ini` (up to `3600` seconds), then prompts you to launch the game again.
 - When the last tracked game stops, ShadowMount immediately enables kstuff again if it was the component that disabled it.
 
@@ -175,7 +236,7 @@ PFSC container layout requirement (`.ffpfsc`):
 - Do not place game files directly in the container root.
 - Place supported nested image files inside the container; ShadowMountPlus mounts those nested images and scans them for the game.
 - A nested `pfs_image.dat` file inside a PFSC container is treated as a PFS image.
-- `.ffpfsc` uses the nested outer PFS profile (`img_type=0x02`); `.ffpfs` and `pfs_image.dat` files mounted from inside it use the nested inner profile (`img_type=0x82`). Signature verification and GDDR5 cache setup are kept in code but currently disabled.
+- `.ffpfsc` always uses the optimized nested outer PFS profile (`img_type=0x02`). A standalone `.ffpfs` source uses the optimized profile only under `/data/...` or `/user/...`; other standalone sources use the version 1.6 parameters. Nested `.ffpfs`/`pfs_image.dat` images always use the optimized inner profile with `img_type=0x82`. Signature verification remains disabled for unsigned images; set `nested_pfs_index_cache=1` to request the PFSC compressed-offset cache before attaching nested images.
 
 ## Compressed PFS containers (`.ffpfsc`)
 
@@ -331,6 +392,42 @@ Recommended folder structure:
 
 Recommended only for titles that need external-drive-style compatibility. For general use, prefer `.ffpkg`.
 
+### LVD type-5 / BFS fast-path requirements
+
+For direct source paths under `/data/...` or `/user/...`, ShadowMount attaches
+`.exfat` through LVD as `img_type=5 (Sv)`, with a 512-byte logical sector and a
+64 KiB `secondary_unit`. This lets the LVD worker collect
+up to 31 queued, 64-KiB-aligned requests of exactly 64 KiB and
+submit them through `bfs_iosession_rw_sdimg`/`BfsSdimg`. Non-matching requests
+continue through the normal vnode path.
+
+All of the following are required for the kernel to consider that fast path:
+
+- Use `exfat_backend=lvd` (the default). `/dev/mdctl` has no LVD image type or
+  BFS sdimg batching.
+- A `.exfat` source outside `/data/...` and `/user/...` uses the `img_type=0`
+  profile directly. No second mount attempt is made after failure.
+- Store the final `.exfat` file directly on the internal BFS, normally below
+  `/data`. An image on USB/UFS/exFAT/PFS, or an exFAT image nested in compressed
+  PFS, uses the normal path.
+- Format exFAT with a fixed 64 KiB allocation unit. The supplied Linux, macOS,
+  and Windows builders now always use this value, including small-file images.
+- Keep `lvd_exfat_sector_size=512` and do not add an
+  `image_sector=<name>.exfat:65536` override. A logical sector and an exFAT
+  allocation unit are different geometries.
+- Make the image size a multiple of 64 KiB; the supplied builders round it to
+  1 MiB and therefore satisfy this automatically.
+- Copy the completed image to BFS in one sequential operation when practical.
+  This does not control eligibility, but avoids needless fragmentation of the
+  backing file. The default read-only mount is preferred when writes are not
+  required.
+
+The 64 KiB cluster improves eligibility but cannot force every access through
+the batch path: exFAT metadata and small or unaligned application I/O still use
+the normal vnode path. In the ShadowMount debug log, an eligible profile request is
+shown by `img=5 sec=512 sec2=65536`; the kernel still makes the final BFS and
+platform checks internally.
+
 Linux (Ubuntu/Debian):
 - Required components installation:
   - `sudo apt-get update && sudo apt-get install -y exfatprogs exfat-fuse fuse3 rsync`
@@ -342,10 +439,15 @@ Linux (Ubuntu/Debian):
 - Notes:
   - Source folder must be the game root and contain `eboot.bin`.
   - Auto-calculates image size using rounded file allocation + metadata + safety margin.
-  - For manual exFAT builds, keep the cluster size at `64 KB` or you may lose performance.
-  - Automatically selects exFAT cluster profile:
-  - Large-file profile: `64K`
-  - Small/mixed-file profile: `32K`
+  - Always formats with `mkfs.exfat -c 64K` for the LVD/BFS profile.
+  - For a manual build, use an image size divisible by 64 KiB and run `mkfs.exfat -c 64K <image>`.
+
+macOS:
+
+- Script: `mkexfat_macos.sh` (uses the built-in exFAT, disk-image and `rsync` tools).
+- Example: `chmod +x mkexfat_macos.sh && ./mkexfat_macos.sh ./APPXXXX ./PPSA12345.exfat`.
+- The script attaches the raw image as a device and formats it with
+  `newfs_exfat -b 65536` before copying the game-root contents.
 
 Windows:
 - Recommended: use `make_image.bat` (wrapper for `New-OsfExfatImage.ps1` + OSFMount).
@@ -353,13 +455,14 @@ Windows:
   - Install OSFMount: https://www.osforensics.com/tools/mount-disk-images.html.
   - Keep `make_image.bat` and `New-OsfExfatImage.ps1` in the same folder.
   - Run `cmd.exe` as Administrator.
-  - If you build an exFAT image manually instead of using the script, keep the cluster size at `64 KB` or you may lose performance.
+  - If you build an exFAT image manually, format it with a `64K` allocation unit, for example `format X: /FS:exFAT /A:64K /Q`.
 - Usage:
   - `make_image.bat "C:\images\game.exfat" "C:\payload\APPXXXX"`
 - Behavior:
   - Auto-sizes the image to fit source content.
   - Source folder must be the game root and contain `eboot.bin`.
   - Formats and copies source folder contents into image root.
+  - Uses a fixed 64 KiB allocation unit for both large-file and small/mixed-file images.
 - Optional (fixed size): run PowerShell script directly:
   - `powershell.exe -ExecutionPolicy Bypass -File .\New-OsfExfatImage.ps1 -ImagePath "C:\images\game.exfat" -SourceDir "C:\payload\APPXXXX" -Size 8G -ForceOverwrite`
 

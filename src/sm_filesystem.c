@@ -4,10 +4,15 @@
 #include "sm_config_mount.h"
 #include "sm_limits.h"
 #include "sm_log.h"
+#include "sm_mount_diag.h"
 #include "sm_image_cache.h"
 #include "sm_image.h"
 #include "sm_path_utils.h"
 #include "sm_paths.h"
+
+static bool unmount_controlled_mount_stack(const char *path);
+static bool unmount_controlled_mount_stack_impl(const char *path,
+                                                bool diagnose_busy);
 
 // --- FILESYSTEM ---
 bool is_installed(const char *title_id) {
@@ -87,7 +92,7 @@ typedef bool (*title_app_dir_iter_fn)(const char *title_id,
                                       const title_link_paths_t *paths,
                                       void *ctx);
 
-static void for_each_title_app_dir(const char *open_error_context,
+static bool for_each_title_app_dir(const char *open_error_context,
                                    bool stop_on_signal,
                                    title_app_dir_iter_fn fn, void *ctx) {
   DIR *d = opendir(APP_BASE);
@@ -95,23 +100,30 @@ static void for_each_title_app_dir(const char *open_error_context,
     if (errno != ENOENT)
       log_debug("  [LINK] open %s failed%s: %s", APP_BASE,
                 open_error_context ? open_error_context : "", strerror(errno));
-    return;
+    return errno == ENOENT;
   }
 
+  bool completed = true;
   struct dirent *entry;
   while ((entry = readdir(d)) != NULL) {
-    if (stop_on_signal && should_stop_requested())
+    if (stop_on_signal && should_stop_requested()) {
+      completed = false;
       break;
+    }
     if (!resolve_title_app_dir(entry, NULL, 0))
       continue;
 
     title_link_paths_t paths;
     build_title_link_paths(entry->d_name, &paths);
-    if (!fn(entry->d_name, &paths, ctx))
+    if (!fn(entry->d_name, &paths, ctx)) {
+      completed = false;
       break;
+    }
   }
 
-  closedir(d);
+  if (closedir(d) != 0)
+    completed = false;
+  return completed;
 }
 
 bool read_mount_link(const char *title_id, char *out, size_t out_size) {
@@ -122,6 +134,131 @@ bool read_mount_link(const char *title_id, char *out, size_t out_size) {
   title_link_paths_t paths;
   build_title_link_paths(title_id, &paths);
   return read_mount_link_file(paths.mount_link, out, out_size);
+}
+
+static bool write_link_lines_atomic(const char *path,
+                                    const char *const *lines,
+                                    size_t count) {
+  char temp_path[MAX_PATH];
+  int written = snprintf(temp_path, sizeof(temp_path), "%s.tmp", path);
+  if (written < 0 || (size_t)written >= sizeof(temp_path))
+    return false;
+
+  FILE *file = fopen(temp_path, "w");
+  if (!file)
+    return false;
+
+  bool ok = true;
+  for (size_t i = 0; i < count; ++i) {
+    if (!lines[i] || lines[i][0] == '\0' ||
+        fprintf(file, "%s%s", lines[i], i + 1u < count ? "\n" : "") < 0) {
+      ok = false;
+      break;
+    }
+  }
+  if (ok && fflush(file) != 0)
+    ok = false;
+  if (ok && fsync(fileno(file)) != 0)
+    ok = false;
+  if (fclose(file) != 0)
+    ok = false;
+  if (ok && rename(temp_path, path) == 0)
+    return true;
+
+  int saved_errno = errno != 0 ? errno : EIO;
+  (void)unlink(temp_path);
+  errno = saved_errno;
+  return false;
+}
+
+bool write_mount_link(const char *title_id, const char *source_path) {
+  if (!title_id || title_id[0] == '\0' || !source_path ||
+      source_path[0] == '\0') {
+    return false;
+  }
+
+  title_link_paths_t paths;
+  build_title_link_paths(title_id, &paths);
+  const char *lines[] = {source_path};
+  return write_link_lines_atomic(paths.mount_link, lines, 1);
+}
+
+bool read_mount_image_link(const char *title_id, char *out, size_t out_size) {
+  if (!title_id || !out || out_size == 0)
+    return false;
+  out[0] = '\0';
+
+  title_link_paths_t paths;
+  build_title_link_paths(title_id, &paths);
+  return read_mount_link_file(paths.mount_image_link, out, out_size);
+}
+
+bool write_mount_image_link(const char *title_id, const char *image_path) {
+  if (!title_id || title_id[0] == '\0' || !image_path ||
+      image_path[0] == '\0') {
+    return false;
+  }
+  char chain[MAX_IMAGE_CHAIN_DEPTH][MAX_PATH] = {{0}};
+  (void)strlcpy(chain[0], image_path, sizeof(chain[0]));
+  return write_mount_image_chain(title_id, chain, 1);
+}
+
+bool read_mount_image_chain(
+    const char *title_id,
+    char paths[MAX_IMAGE_CHAIN_DEPTH][MAX_PATH], size_t *count_out) {
+  if (!title_id || !paths || !count_out)
+    return false;
+  *count_out = 0;
+
+  title_link_paths_t link_paths;
+  build_title_link_paths(title_id, &link_paths);
+  FILE *file = fopen(link_paths.mount_image_link, "r");
+  if (!file)
+    return false;
+
+  bool ok = true;
+  while (*count_out < MAX_IMAGE_CHAIN_DEPTH &&
+         fgets(paths[*count_out], MAX_PATH, file)) {
+    size_t len = strcspn(paths[*count_out], "\r\n");
+    if (paths[*count_out][len] == '\0' && len + 1u >= MAX_PATH) {
+      int next = fgetc(file);
+      if (next != EOF && next != '\n' && next != '\r') {
+        ok = false;
+        break;
+      }
+    }
+    paths[*count_out][len] = '\0';
+    if (len == 0) {
+      ok = false;
+      break;
+    }
+    (*count_out)++;
+  }
+  if (ok && *count_out == MAX_IMAGE_CHAIN_DEPTH && fgetc(file) != EOF)
+    ok = false;
+  if (ferror(file))
+    ok = false;
+  if (fclose(file) != 0)
+    ok = false;
+  if (!ok)
+    *count_out = 0;
+  return ok && *count_out > 0;
+}
+
+bool write_mount_image_chain(
+    const char *title_id,
+    const char paths[MAX_IMAGE_CHAIN_DEPTH][MAX_PATH], size_t count) {
+  if (!title_id || title_id[0] == '\0' || !paths || count == 0 ||
+      count > MAX_IMAGE_CHAIN_DEPTH) {
+    return false;
+  }
+
+  title_link_paths_t link_paths;
+  build_title_link_paths(title_id, &link_paths);
+  const char *lines[MAX_IMAGE_CHAIN_DEPTH];
+  for (size_t i = 0; i < count; ++i)
+    lines[i] = paths[i];
+  return write_link_lines_atomic(link_paths.mount_image_link, lines, count);
 }
 
 bool resolve_title_app_dir(const struct dirent *entry, char *app_dir,
@@ -159,14 +296,18 @@ bool resolve_title_app_dir(const struct dirent *entry, char *app_dir,
   return true;
 }
 
-static bool source_path_needs_cleanup(const char *source_path,
-                                      bool *tried_image_recovery) {
+static bool source_path_needs_cleanup(const char *source_path) {
   if (is_under_image_mount_base(source_path)) {
     char image_source_path[MAX_PATH];
     bool has_image_source = resolve_image_source_from_mount_cache(
         source_path, image_source_path, sizeof(image_source_path));
-    if (has_image_source && !path_exists(image_source_path))
-      return true;
+    if (has_image_source) {
+      if (!path_exists(image_source_path))
+        return true;
+      // The image mount point is intentionally absent outside install/launch.
+      if (!path_exists(source_path))
+        return false;
+    }
   }
 
   if (!path_exists(source_path))
@@ -181,11 +322,6 @@ static bool source_path_needs_cleanup(const char *source_path,
     return true;
   if (path_exists(eboot_path))
     return false;
-
-  if (!*tried_image_recovery && is_under_image_mount_base(source_path)) {
-    cleanup_stale_image_mounts();
-    *tried_image_recovery = true;
-  }
 
   return !path_exists(eboot_path);
 }
@@ -459,7 +595,8 @@ static bool inspect_title_stack(const char *title_id, const char *source_path,
   return true;
 }
 
-static bool unmount_top_controlled_layer(const char *path) {
+static bool unmount_top_controlled_layer_impl(const char *path,
+                                              bool diagnose_busy) {
   struct statfs mount_st;
   if (!get_top_mount(path, &mount_st))
     return true;
@@ -476,11 +613,20 @@ static bool unmount_top_controlled_layer(const char *path) {
 
   if (unmount(path, 0) == 0 || errno == ENOENT || errno == EINVAL)
     return true;
-  if (unmount(path, MNT_FORCE) == 0 || errno == ENOENT || errno == EINVAL)
-    return true;
+  int unmount_errno = errno;
+  if (unmount_errno == EBUSY && diagnose_busy)
+    sm_mount_diag_log_busy(path);
 
-  log_debug("  [LINK] unmount failed for %s: %s", path, strerror(errno));
+  if (unmount_errno != EBUSY || diagnose_busy) {
+    log_debug("  [LINK] unmount deferred for %s: %s", path,
+              strerror(unmount_errno));
+  }
+  errno = unmount_errno;
   return false;
+}
+
+static bool unmount_top_controlled_layer(const char *path) {
+  return unmount_top_controlled_layer_impl(path, true);
 }
 
 static bool title_stack_top_is_managed(const title_mount_state_t *state) {
@@ -499,6 +645,60 @@ bool rollback_title_nullfs_mount(const char *title_id, const char *src_path) {
   log_debug("  [LINK] rolled back unpublished nullfs mount: %s -> %s",
             src_path, state.system_ex_path);
   return true;
+}
+
+static bool unmount_title_runtime_layers_impl(const char *title_id,
+                                              bool diagnose_busy) {
+  if (!title_id || title_id[0] == '\0')
+    return false;
+
+  char path[MAX_PATH];
+  int written = snprintf(path, sizeof(path), "/system_ex/app/%s", title_id);
+  if (written < 0 || (size_t)written >= sizeof(path))
+    return false;
+
+  if (!unmount_controlled_mount_stack_impl(path, diagnose_busy))
+    return false;
+  log_debug("  [LINK] runtime layers released: %s", title_id);
+  return true;
+}
+
+bool unmount_title_runtime_layers(const char *title_id) {
+  return unmount_title_runtime_layers_impl(title_id, true);
+}
+
+bool unmount_title_runtime_layers_quiet(const char *title_id) {
+  return unmount_title_runtime_layers_impl(title_id, false);
+}
+
+static bool unmount_managed_title_entry(
+    const char *title_id, const title_link_paths_t *paths, void *ctx) {
+  bool *all_released = (bool *)ctx;
+  char source_path[MAX_PATH];
+  if (!read_mount_link_file(paths->mount_link, source_path,
+                            sizeof(source_path))) {
+    return true;
+  }
+  title_mount_state_t state;
+  if (!inspect_title_stack(title_id, source_path, NULL, &state)) {
+    *all_released = false;
+    return true;
+  }
+  if (!state.has_our_nullfs) {
+    return true;
+  }
+  if (!unmount_title_runtime_layers(title_id))
+    *all_released = false;
+  return true;
+}
+
+bool unmount_all_title_runtime_layers(void) {
+  bool all_released = true;
+  if (!for_each_title_app_dir(" during runtime mount cleanup", false,
+                              unmount_managed_title_entry, &all_released)) {
+    all_released = false;
+  }
+  return all_released;
 }
 
 bool reconcile_title_backport_mount(const char *title_id, const char *src_path,
@@ -541,6 +741,88 @@ bool reconcile_title_backport_mount(const char *title_id, const char *src_path,
   return backport_present;
 }
 
+static void log_backport_overlay_path(const char *label, const char *path,
+                                      const struct stat *known_stat,
+                                      const struct statfs *known_statfs) {
+  struct stat path_stat;
+  const struct stat *st = known_stat;
+  if (!st) {
+    if (stat(path, &path_stat) != 0) {
+      int stat_errno = errno;
+      log_debug("  [IMG][UNIONFS] %s stat failed: path=%s error=%d (%s)",
+                label, path, stat_errno, strerror(stat_errno));
+    } else {
+      st = &path_stat;
+    }
+  }
+  if (st) {
+    log_debug("  [IMG][UNIONFS] %s stat: path=%s mode=0%o uid=%lu gid=%lu "
+              "dev=0x%llX ino=0x%llX",
+              label, path, (unsigned)st->st_mode,
+              (unsigned long)st->st_uid, (unsigned long)st->st_gid,
+              (unsigned long long)st->st_dev,
+              (unsigned long long)st->st_ino);
+  }
+
+  struct statfs path_statfs;
+  const struct statfs *sfs = known_statfs;
+  if (!sfs) {
+    if (statfs(path, &path_statfs) != 0) {
+      int statfs_errno = errno;
+      log_debug("  [IMG][UNIONFS] %s statfs failed: path=%s error=%d (%s)",
+                label, path, statfs_errno, strerror(statfs_errno));
+    } else {
+      sfs = &path_statfs;
+    }
+  }
+  if (sfs) {
+    log_debug("  [IMG][UNIONFS] %s fs: type=%s from=%s on=%s "
+              "flags=0x%lX bsize=%lu iosize=%ld",
+              label, sfs->f_fstypename, sfs->f_mntfromname,
+              sfs->f_mntonname, (unsigned long)sfs->f_flags,
+              (unsigned long)sfs->f_bsize, (long)sfs->f_iosize);
+  }
+}
+
+static void log_backport_overlay_failure(const char *mount_point,
+                                         const char *backport_path,
+                                         const struct stat *backport_stat,
+                                         const struct statfs *mounted_sfs,
+                                         int overlay_flags,
+                                         int overlay_errno) {
+  log_debug("  [IMG][UNIONFS] nmount failed: error=%d (%s) "
+            "mount_flags=0x%X read_only=%d euid=%lu egid=%lu "
+            "options=copymode:transparent,noatime,fnodup",
+            overlay_errno, strerror(overlay_errno), overlay_flags,
+            (overlay_flags & MNT_RDONLY) != 0 ? 1 : 0,
+            (unsigned long)geteuid(), (unsigned long)getegid());
+  log_backport_overlay_path("upper", backport_path, backport_stat, NULL);
+  log_backport_overlay_path("covered", mount_point, NULL, mounted_sfs);
+
+  struct statfs *mounts = NULL;
+  int mount_count = getmntinfo(&mounts, MNT_NOWAIT);
+  if (mount_count <= 0 || !mounts) {
+    int table_errno = errno;
+    log_debug("  [IMG][UNIONFS] mount table unavailable: error=%d (%s)",
+              table_errno, strerror(table_errno));
+    return;
+  }
+  int exact_count = 0;
+  for (int i = 0; i < mount_count; ++i) {
+    if (strcmp(mounts[i].f_mntonname, mount_point) != 0)
+      continue;
+    exact_count++;
+    log_debug("  [IMG][UNIONFS] covered layer[%d]: type=%s from=%s "
+              "flags=0x%lX",
+              exact_count - 1, mounts[i].f_fstypename,
+              mounts[i].f_mntfromname, (unsigned long)mounts[i].f_flags);
+  }
+  if (exact_count == 0) {
+    log_debug("  [IMG][UNIONFS] no exact mount-table entry for %s",
+              mount_point);
+  }
+}
+
 bool mount_backport_overlay(const char *mount_point,
                             const char *backport_path,
                             const char *title_id) {
@@ -576,17 +858,21 @@ bool mount_backport_overlay(const char *mount_point,
   int overlay_err = errno;
   log_debug("  [IMG] backport overlay failed: %s -> %s (%s)", backport_path,
             mount_point, strerror(overlay_err));
-  notify_system("Backport overlay failed: %s\n%s\n0x%08X", title_id,
-                backport_path, (uint32_t)overlay_err);
+  log_backport_overlay_failure(mount_point, backport_path, &backport_st,
+                               &mounted_sfs, overlay_flags, overlay_err);
+  notify_system_l10n(SM_L10N_BACKPORT_OVERLAY_FAILED, title_id, backport_path,
+                     (uint32_t)overlay_err);
+  errno = overlay_err;
   return false;
 }
 
-static bool unmount_controlled_mount_stack(const char *path) {
+static bool unmount_controlled_mount_stack_impl(const char *path,
+                                                bool diagnose_busy) {
   for (int i = 0; i < MAX_LAYERED_UNMOUNT_ATTEMPTS * 4; i++) {
     struct statfs mount_st;
     if (!get_top_mount(path, &mount_st))
       return true;
-    if (!unmount_top_controlled_layer(path))
+    if (!unmount_top_controlled_layer_impl(path, diagnose_busy))
       return false;
   }
 
@@ -594,27 +880,14 @@ static bool unmount_controlled_mount_stack(const char *path) {
   return !get_top_mount(path, &mount_st);
 }
 
+static bool unmount_controlled_mount_stack(const char *path) {
+  return unmount_controlled_mount_stack_impl(path, true);
+}
+
 static void unmount_mount_point_for_recovery(const char *path) {
   if (!unmount_controlled_mount_stack(path)) {
     log_debug("  [LINK] failed to reset mount stack for recovery: %s", path);
   }
-
-  if (unmount(path, 0) == 0) {
-    log_debug("  [LINK] extra unmount for recovery: %s", path);
-    return;
-  }
-  if (errno == ENOENT || errno == EINVAL)
-    return;
-
-  if (unmount(path, MNT_FORCE) == 0) {
-    log_debug("  [LINK] extra forced unmount for recovery: %s", path);
-    return;
-  }
-  if (errno == ENOENT || errno == EINVAL)
-    return;
-
-  log_debug("  [LINK] extra unmount for recovery did not complete for %s: %s",
-            path, strerror(errno));
 }
 
 static bool recover_mount_directory_after_stat_failure(
@@ -686,7 +959,26 @@ void cleanup_duplicate_title_mounts(void) {
 }
 
 // --- Copy Helpers for Install Action ---
-static int copy_param_json_rewrite(const char *src, const char *dst) {
+static FILE *open_copy_destination(const char *path, bool set_mode,
+                                   mode_t mode) {
+  if (!set_mode)
+    return fopen(path, "wb");
+
+  int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, mode);
+  if (fd < 0)
+    return NULL;
+  FILE *file = fdopen(fd, "wb");
+  if (!file) {
+    int saved_errno = errno;
+    (void)close(fd);
+    (void)unlink(path);
+    errno = saved_errno;
+  }
+  return file;
+}
+
+static int copy_param_json_rewrite(const char *src, const char *dst,
+                                   bool set_mode, mode_t mode) {
   FILE *fs = fopen(src, "rb");
   if (!fs)
     return -1;
@@ -729,15 +1021,13 @@ static int copy_param_json_rewrite(const char *src, const char *dst) {
     len -= 2u;
   }
 
-  FILE *fd = fopen(dst, "wb");
+  FILE *fd = open_copy_destination(dst, set_mode, mode);
   if (!fd) {
     free(buf);
     return -1;
   }
 
-  int ret = 0;
-  if (len > 0 && fwrite(buf, 1, len, fd) != len)
-    ret = -1;
+  int ret = len > 0 && fwrite(buf, 1, len, fd) != len ? -1 : 0;
   if (fclose(fd) != 0)
     ret = -1;
 
@@ -750,28 +1040,31 @@ static int copy_param_json_rewrite(const char *src, const char *dst) {
   return ret;
 }
 
-int copy_file(const char *src, const char *dst) {
+static int copy_file_buffered(const char *src, const char *dst, bool set_mode,
+                              mode_t mode, char *buffer,
+                              size_t buffer_size) {
   if (strstr(src, "/sce_sys/param.json")) {
-    return copy_param_json_rewrite(src, dst);
+    return copy_param_json_rewrite(src, dst, set_mode, mode);
   }
 
-  char buf[8192];
   FILE *fs = fopen(src, "rb");
   if (!fs)
     return -1;
-  FILE *fd = fopen(dst, "wb");
+  FILE *fd = open_copy_destination(dst, set_mode, mode);
   if (!fd) {
     fclose(fs);
     return -1;
   }
   int ret = 0;
   while (true) {
-    size_t n = fread(buf, 1, sizeof(buf), fs);
-    if (n > 0 && fwrite(buf, 1, n, fd) != n) {
+    if (ret != 0)
+      break;
+    size_t n = fread(buffer, 1, buffer_size, fs);
+    if (n > 0 && fwrite(buffer, 1, n, fd) != n) {
       ret = -1;
       break;
     }
-    if (n < sizeof(buf)) {
+    if (n < buffer_size) {
       if (ferror(fs))
         ret = -1;
       break;
@@ -788,9 +1081,61 @@ int copy_file(const char *src, const char *dst) {
   return ret;
 }
 
-int copy_dir(const char *src, const char *dst) {
-  if (mkdir(dst, 0777) != 0 && errno != EEXIST)
+static int copy_file_impl(const char *src, const char *dst, bool set_mode,
+                          mode_t mode) {
+  const size_t buffer_size = 64u * 1024u;
+  char *buffer = malloc(buffer_size);
+  if (!buffer)
     return -1;
+  int ret = copy_file_buffered(src, dst, set_mode, mode, buffer, buffer_size);
+  free(buffer);
+  return ret;
+}
+
+static int remove_copy_path(const char *path) {
+  struct stat st;
+  if (lstat(path, &st) != 0)
+    return errno == ENOENT ? 0 : -1;
+  if (!S_ISDIR(st.st_mode))
+    return unlink(path);
+
+  DIR *d = opendir(path);
+  if (!d)
+    return -1;
+  int ret = 0;
+  struct dirent *entry;
+  while (ret == 0 && (entry = readdir(d)) != NULL) {
+    if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, ".."))
+      continue;
+    char child[MAX_PATH];
+    int written = snprintf(child, sizeof(child), "%s/%s", path,
+                           entry->d_name);
+    if (written < 0 || (size_t)written >= sizeof(child) ||
+        remove_copy_path(child) != 0) {
+      ret = -1;
+    }
+  }
+  if (closedir(d) != 0)
+    ret = -1;
+  if (ret == 0 && rmdir(path) != 0)
+    ret = -1;
+  return ret;
+}
+
+static int copy_dir_impl(const char *src, const char *dst, bool set_mode,
+                         mode_t mode, bool overlay, char *buffer,
+                         size_t buffer_size) {
+  if (mkdir(dst, set_mode ? mode : 0777) != 0) {
+    if (errno != EEXIST)
+      return -1;
+    struct stat dst_st;
+    if (lstat(dst, &dst_st) != 0)
+      return -1;
+    if (!S_ISDIR(dst_st.st_mode)) {
+      errno = ENOTDIR;
+      return -1;
+    }
+  }
   DIR *d = opendir(src);
   if (!d)
     return -1;
@@ -826,13 +1171,34 @@ int copy_dir(const char *src, const char *dst) {
     } else {
       st = lst;
     }
+    if (!S_ISDIR(st.st_mode) && !S_ISREG(st.st_mode)) {
+      errno = EINVAL;
+      ret = -1;
+      break;
+    }
+    if (overlay) {
+      struct stat dst_st;
+      if (lstat(dd, &dst_st) == 0) {
+        if (!S_ISDIR(st.st_mode) || !S_ISDIR(dst_st.st_mode)) {
+          if (remove_copy_path(dd) != 0) {
+            ret = -1;
+            break;
+          }
+        }
+      } else if (errno != ENOENT) {
+        ret = -1;
+        break;
+      }
+    }
     if (S_ISDIR(st.st_mode)) {
-      if (copy_dir(ss, dd) != 0) {
+      if (copy_dir_impl(ss, dd, set_mode, mode, overlay, buffer,
+                        buffer_size) != 0) {
         ret = -1;
         break;
       }
     } else {
-      if (copy_file(ss, dd) != 0) {
+      if (copy_file_buffered(ss, dd, set_mode, mode, buffer, buffer_size) !=
+          0) {
         ret = -1;
         break;
       }
@@ -841,6 +1207,34 @@ int copy_dir(const char *src, const char *dst) {
   if (closedir(d) != 0)
     ret = -1;
   return ret;
+}
+
+static int copy_dir_with_options(const char *src, const char *dst,
+                                 bool set_mode, mode_t mode, bool overlay) {
+  const size_t buffer_size = 64u * 1024u;
+  char *buffer = malloc(buffer_size);
+  if (!buffer)
+    return -1;
+  int ret = copy_dir_impl(src, dst, set_mode, mode, overlay, buffer,
+                          buffer_size);
+  free(buffer);
+  return ret;
+}
+
+int copy_file(const char *src, const char *dst) {
+  return copy_file_impl(src, dst, false, 0);
+}
+
+int copy_file_with_mode(const char *src, const char *dst, mode_t mode) {
+  return copy_file_impl(src, dst, true, mode);
+}
+
+int copy_dir(const char *src, const char *dst) {
+  return copy_dir_with_options(src, dst, false, 0, false);
+}
+
+int copy_dir_with_mode(const char *src, const char *dst, mode_t mode) {
+  return copy_dir_with_options(src, dst, true, mode, true);
 }
 
 int remount_system_ex(void) {
@@ -880,8 +1274,7 @@ bool mount_title_nullfs(const char *title_id, const char *src_path) {
     return false;
   }
   if (!path_exists(src_eboot)) {
-    bool tried_image_recovery = false;
-    if (source_path_needs_cleanup(src_path, &tried_image_recovery)) {
+    if (source_path_needs_cleanup(src_path)) {
       log_debug("  [LINK] source eboot.bin missing for %s: %s", title_id,
                 src_eboot);
       return false;
@@ -945,20 +1338,16 @@ bool mount_title_nullfs(const char *title_id, const char *src_path) {
   }
 
   if (runtime_sleep_mode_active()) {
-    if (unmount(dst, 0) != 0 && errno != ENOENT && errno != EINVAL)
-      (void)unmount(dst, MNT_FORCE);
+    if (!unmount_top_controlled_layer(dst))
+      log_debug("  [LINK] nullfs rollback deferred during sleep: %s", dst);
     return false;
   }
 
   if (!path_exists(dst_eboot)) {
     log_debug("  [LINK] mounted nullfs but eboot.bin is missing at target: %s",
               dst_eboot);
-    if (unmount(dst, 0) != 0 && errno != ENOENT && errno != EINVAL) {
-      if (unmount(dst, MNT_FORCE) != 0 && errno != ENOENT && errno != EINVAL) {
-        log_debug("  [LINK] failed to rollback empty nullfs mount %s: %s", dst,
-                  strerror(errno));
-      }
-    }
+    if (!unmount_top_controlled_layer(dst))
+      log_debug("  [LINK] empty nullfs rollback deferred: %s", dst);
     return false;
   }
   log_debug("  [LINK] nullfs mounted: %s -> %s", src_path, dst);
@@ -968,9 +1357,9 @@ bool mount_title_nullfs(const char *title_id, const char *src_path) {
 typedef struct {
   const char *removed_source_root;
   bool unmount_system_ex_bind;
-  bool tried_image_recovery;
   bool force_remove_matching_source;
   bool match_usb_sources;
+  bool preserve_mount_links;
 } cleanup_mount_links_ctx_t;
 
 static bool cleanup_mount_links_entry(const char *title_id,
@@ -1014,12 +1403,10 @@ static bool cleanup_mount_links_entry(const char *title_id,
         return true;
       should_remove = ctx->force_remove_matching_source ||
                       (has_image_source && !path_exists(image_source_path)) ||
-                      source_path_needs_cleanup(source_path,
-                                                &ctx->tried_image_recovery);
+                      source_path_needs_cleanup(source_path);
     } else {
       should_remove = (has_image_source && !path_exists(image_source_path)) ||
-                      source_path_needs_cleanup(source_path,
-                                                &ctx->tried_image_recovery);
+                      source_path_needs_cleanup(source_path);
     }
   }
 
@@ -1042,17 +1429,19 @@ static bool cleanup_mount_links_entry(const char *title_id,
       stack_matches_link = state.has_nullfs_from_root;
     }
 
-    if (inspected && stack_matches_link && !top_is_ours) {
+    if (stack_matches_link && !top_is_ours) {
       keep_mount_link = true;
       log_debug("  [LINK] keeping mount link for %s: stack still active but "
                 "top layer is not ours", state.system_ex_path);
-    } else if (inspected && top_is_ours && stack_matches_link) {
-      if (rename(paths->mount_link, paths->staged_mount_link) != 0) {
-        log_debug("  [LINK] stage failed for %s: %s", paths->mount_link,
-                  strerror(errno));
-        return true;
+    } else if (top_is_ours && stack_matches_link) {
+      if (!ctx->preserve_mount_links) {
+        if (rename(paths->mount_link, paths->staged_mount_link) != 0) {
+          log_debug("  [LINK] stage failed for %s: %s", paths->mount_link,
+                    strerror(errno));
+          return true;
+        }
+        mount_link_staged = true;
       }
-      mount_link_staged = true;
       if (!unmount_controlled_mount_stack(state.system_ex_path)) {
         keep_mount_link = true;
         log_debug("  [LINK] failed to unmount mount stack for %s",
@@ -1065,6 +1454,9 @@ static bool cleanup_mount_links_entry(const char *title_id,
       }
     }
   }
+
+  if (ctx->preserve_mount_links)
+    keep_mount_link = true;
 
   if (!keep_mount_link) {
     int unlink_res = mount_link_staged ? unlink(paths->staged_mount_link)
@@ -1084,8 +1476,7 @@ static bool cleanup_mount_links_entry(const char *title_id,
   }
 
   if (mount_link_staged && rename(paths->staged_mount_link, paths->mount_link) == 0) {
-    log_debug("  [LINK] restored mount link after failed cleanup: %s",
-              paths->mount_link);
+    log_debug("  [LINK] restored staged mount link: %s", paths->mount_link);
   } else if (mount_link_staged) {
     log_debug("  [LINK] restore failed for %s: %s", paths->mount_link,
               strerror(errno));
@@ -1098,9 +1489,9 @@ void cleanup_mount_links(const char *removed_source_root,
   cleanup_mount_links_ctx_t ctx = {
       .removed_source_root = removed_source_root,
       .unmount_system_ex_bind = unmount_system_ex_bind,
-      .tried_image_recovery = false,
       .force_remove_matching_source = false,
       .match_usb_sources = false,
+      .preserve_mount_links = false,
   };
   for_each_title_app_dir("", !unmount_system_ex_bind, cleanup_mount_links_entry,
                          &ctx);
@@ -1113,9 +1504,9 @@ void cleanup_mount_links_for_source_unmount(const char *source_root) {
   cleanup_mount_links_ctx_t ctx = {
       .removed_source_root = source_root,
       .unmount_system_ex_bind = true,
-      .tried_image_recovery = false,
       .force_remove_matching_source = true,
       .match_usb_sources = false,
+      .preserve_mount_links = false,
   };
   for_each_title_app_dir(" during source unmount cleanup", false,
                          cleanup_mount_links_entry, &ctx);
@@ -1125,9 +1516,9 @@ void cleanup_usb_mount_links_for_suspend(void) {
   cleanup_mount_links_ctx_t ctx = {
       .removed_source_root = NULL,
       .unmount_system_ex_bind = true,
-      .tried_image_recovery = false,
       .force_remove_matching_source = false,
       .match_usb_sources = true,
+      .preserve_mount_links = true,
   };
   for_each_title_app_dir(" during USB suspend cleanup", false,
                          cleanup_mount_links_entry, &ctx);
@@ -1136,7 +1527,7 @@ void cleanup_usb_mount_links_for_suspend(void) {
 static bool shutdown_title_mounts_entry(const char *title_id,
                                         const title_link_paths_t *paths,
                                         void *ctx) {
-  (void)ctx;
+  bool *all_released = (bool *)ctx;
 
   char source_path[MAX_PATH];
   if (!read_mount_link_file(paths->mount_link, source_path, sizeof(source_path))) {
@@ -1144,20 +1535,32 @@ static bool shutdown_title_mounts_entry(const char *title_id,
   }
 
   title_mount_state_t state;
-  if (!inspect_title_stack(title_id, source_path, NULL, &state) ||
-      !state.has_our_nullfs ||
-      !title_stack_top_is_managed(&state)) {
+  if (!inspect_title_stack(title_id, source_path, NULL, &state)) {
+    *all_released = false;
+    return true;
+  }
+  if (!state.has_our_nullfs)
+    return true;
+  if (!title_stack_top_is_managed(&state)) {
+    log_debug("  [LINK] shutdown stack blocked by unmanaged top for %s",
+              state.system_ex_path);
+    *all_released = false;
     return true;
   }
 
   if (!unmount_controlled_mount_stack(state.system_ex_path)) {
     log_debug("  [LINK] failed to unmount shutdown stack for %s",
               state.system_ex_path);
+    *all_released = false;
   }
   return true;
 }
 
-void shutdown_title_mounts(void) {
-  for_each_title_app_dir(" during shutdown", false,
-                         shutdown_title_mounts_entry, NULL);
+bool shutdown_title_mounts(void) {
+  bool all_released = true;
+  if (!for_each_title_app_dir(" during shutdown", false,
+                              shutdown_title_mounts_entry, &all_released)) {
+    all_released = false;
+  }
+  return all_released;
 }

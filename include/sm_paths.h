@@ -6,13 +6,21 @@
 
 #define DEFAULT_BACKPORTS_DIR_NAME "backports"
 #define DEFAULT_GLOBAL_FAKELIB_PATH "/data/shadowmount/fakelib"
+#define DEFAULT_EMULATORS_PATH "/data/shadowmount/emus"
+#define DEFAULT_AMPR_UPDATE_URL                                             \
+  "https://github.com/drakmor/ampr_emu/releases/latest/download/"         \
+  "libSceAmpr.sprx"
+#define FAKELIB_CACHE_PATH "/data/shadowmount/cache"
+#define ICON_CACHE_DIR "/data/shadowmount/icon-cache"
 #define LOG_DIR "/data/shadowmount"
 #define LOG_FILE "/data/shadowmount/debug.log"
 #define LOG_FILE_PREV "/data/shadowmount/debug.log.1"
+#define WEB_INDEX_FILE "/data/shadowmount/index.html"
 #define CONFIG_FILE "/data/shadowmount/config.ini"
 #define AUTOTUNE_FILE "/data/shadowmount/autotune.ini"
 #define MANUAL_LIST_FILE "/data/shadowmount/manual.lst"
 #define MANUAL_STATUS_FILE "/data/shadowmount/manual.status"
+#define IMAGE_INDEX_FILE_PATH "/data/shadowmount/image_index.bin"
 #define APPMETA_BASE "/user/appmeta"
 #define APP_BASE "/user/app"
 #define KSTUFF_NOAUTOMOUNT_FILE "/data/.kstuff_noautomount"

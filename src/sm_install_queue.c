@@ -1,5 +1,7 @@
 #include "sm_platform.h"
 
+#include <stdatomic.h>
+
 #include "sm_install_queue.h"
 #include "sm_types.h"
 #include "sm_appdb.h"
@@ -9,6 +11,7 @@
 #include "sm_log.h"
 #include "sm_manual.h"
 #include "sm_runtime.h"
+#include "sm_scan.h"
 #include "sm_time.h"
 #include "sm_title_state.h"
 
@@ -36,7 +39,7 @@ typedef struct {
 static pending_install_entry_t g_pending_installs[MAX_PENDING];
 static uint64_t g_pending_install_poll_due_us = 0;
 static uint64_t g_queued_install_submit_due_us = 0;
-static int g_tracked_install_count = 0;
+static atomic_int g_tracked_install_count = 0;
 static int g_submitted_install_count = 0;
 static bool g_queued_install_batch_announced = false;
 static bool g_queued_install_submit_failure_notified = false;
@@ -46,7 +49,14 @@ static uint8_t note_pending_install_failure(const pending_install_entry_t *entry
 static void drop_queued_install_entry(pending_install_entry_t *entry);
 
 static bool install_queue_active(void) {
-  return runtime_config()->app_install_all_enabled || g_tracked_install_count > 0;
+  return runtime_config()->app_install_all_enabled ||
+         atomic_load_explicit(&g_tracked_install_count,
+                              memory_order_acquire) > 0;
+}
+
+bool sm_install_has_pending_work(void) {
+  return atomic_load_explicit(&g_tracked_install_count,
+                              memory_order_acquire) > 0;
 }
 
 static pending_install_entry_t *find_pending_install_entry(
@@ -130,12 +140,17 @@ static void clear_pending_install_entry(pending_install_entry_t *entry) {
     return;
   if (entry->state == INSTALL_TRACK_SUBMITTED && g_submitted_install_count > 0)
     g_submitted_install_count--;
-  if (entry->state != INSTALL_TRACK_NONE && g_tracked_install_count > 0)
-    g_tracked_install_count--;
+  if (entry->state != INSTALL_TRACK_NONE &&
+      atomic_load_explicit(&g_tracked_install_count,
+                           memory_order_relaxed) > 0) {
+    atomic_fetch_sub_explicit(&g_tracked_install_count, 1,
+                              memory_order_release);
+  }
   memset(entry, 0, sizeof(*entry));
   if (g_submitted_install_count <= 0)
     g_pending_install_poll_due_us = 0;
-  if (g_tracked_install_count <= 0) {
+  if (atomic_load_explicit(&g_tracked_install_count,
+                           memory_order_acquire) <= 0) {
     g_queued_install_submit_due_us = 0;
     g_queued_install_batch_announced = false;
     g_queued_install_submit_failure_notified = false;
@@ -204,7 +219,8 @@ bool sm_install_queue_candidate(const scan_candidate_t *candidate,
   entry->has_src_snd0 = has_src_snd0;
   entry->state = INSTALL_TRACK_QUEUED;
   if (previous_state == INSTALL_TRACK_NONE)
-    g_tracked_install_count++;
+    atomic_fetch_add_explicit(&g_tracked_install_count, 1,
+                              memory_order_release);
   if (was_queue_empty) {
     g_queued_install_batch_announced = false;
     g_queued_install_submit_failure_notified = false;
@@ -239,8 +255,8 @@ static void finalize_pending_install_timeout(pending_install_entry_t *entry) {
 
   log_debug("  [REG] Install timeout after 5 minutes: %s (%s)",
             entry->title_name, entry->title_id);
-  notify_system("Install failed: %s (%s)\nTimed out after 5 minutes",
-                entry->title_name, entry->title_id);
+  notify_system_l10n(SM_L10N_INSTALL_FAILED_TIMEOUT, entry->title_name,
+                     entry->title_id);
   (void)note_pending_install_failure(entry);
   clear_pending_install_entry(entry);
 }
@@ -280,6 +296,8 @@ static void poll_pending_installs(void) {
   if (g_submitted_install_count == 0)
     schedule_queued_install_submit(now_us);
   free_app_db_title_list(&app_db_titles);
+  if (!sm_install_has_pending_work() && !release_scan_runtime_mounts())
+    log_debug("  [IMG] deferred release after install completion");
 }
 
 uint64_t sm_install_next_wake_us(uint64_t now_us) {
@@ -340,7 +358,9 @@ static void log_batch_submit_retry_limit(const pending_install_entry_t *entry) {
 }
 
 static int count_queued_installs(void) {
-  int queued_count = g_tracked_install_count - g_submitted_install_count;
+  int queued_count =
+      atomic_load_explicit(&g_tracked_install_count, memory_order_acquire) -
+      g_submitted_install_count;
   return queued_count > 0 ? queued_count : 0;
 }
 
@@ -365,7 +385,8 @@ static void notify_queued_install_batch(void) {
 
   char message[3075];
   int shown_count = 0;
-  snprintf(message, sizeof(message), "Batch install queued (%d):", queued_count);
+  snprintf(message, sizeof(message), sm_l10n_get(SM_L10N_BATCH_INSTALL_QUEUED),
+           queued_count);
 
   for (int i = 0; i < MAX_PENDING; i++) {
     const pending_install_entry_t *entry = &g_pending_installs[i];
@@ -378,7 +399,8 @@ static void notify_queued_install_batch(void) {
   if (shown_count < queued_count) {
     size_t used = strlen(message);
     if (used < sizeof(message)) {
-      (void)snprintf(message + used, sizeof(message) - used, "\n... and %d more",
+      (void)snprintf(message + used, sizeof(message) - used,
+                     sm_l10n_get(SM_L10N_BATCH_INSTALL_AND_MORE),
                      queued_count - shown_count);
     }
   }
@@ -425,12 +447,12 @@ bool sm_install_submit_queued(void) {
   log_queued_install_batch();
   notify_queued_install_batch();
 
-  int res = sceAppInstUtilAppInstallAll();
+  int res = sceAppInstUtilAppInstallAll(NULL);
   if (res != 0) {
     log_debug("  [REG] Batch install request failed: 0x%x", res);
     if (!g_queued_install_submit_failure_notified) {
-      notify_system("Batch install failed for %d app(s).\ncode=0x%08X",
-                    queued_count, (uint32_t)res);
+      notify_system_l10n(SM_L10N_BATCH_INSTALL_FAILED, queued_count,
+                         (uint32_t)res);
       g_queued_install_submit_failure_notified = true;
     }
     schedule_queued_install_submit_retry(now_us);

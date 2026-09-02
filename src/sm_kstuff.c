@@ -708,8 +708,8 @@ static bool apply_kstuff_enabled_state(bool enabled, bool notify_user,
   if (fully_applied) {
     log_debug("  [KSTUFF] %s both sysentvecs", enabled ? "enabled" : "disabled");
     if (notify_user) {
-      notify_system_info(enabled ? "KStuff active again"
-                                 : "KStuff paused while the game is running");
+      notify_system_info_l10n(enabled ? SM_L10N_KSTUFF_ACTIVE
+                                      : SM_L10N_KSTUFF_PAUSED);
     }
   } else {
     log_debug("  [KSTUFF] %s request incomplete (ps5=%s ps4=%s)",
@@ -784,6 +784,34 @@ void sm_kstuff_game_on_exec(pid_t pid, const char *title_id, uint32_t app_id,
             image_backed ? "image" : "direct", delay_seconds);
 }
 
+bool sm_kstuff_game_handoff(pid_t old_pid, pid_t new_pid,
+                            const char *title_id, uint32_t app_id) {
+  if (old_pid <= 0 || new_pid <= 0 || old_pid == new_pid || !title_id ||
+      title_id[0] == '\0') {
+    return false;
+  }
+  if (!g_kstuff.game.active || g_kstuff.game.pid != old_pid ||
+      strcmp(g_kstuff.game.title_id, title_id) != 0) {
+    // Config may have enabled tracking while the old process was pending, or
+    // the old slot may already have been cleared. Start a fresh slot instead
+    // of leaving the replacement process untracked.
+    sm_kstuff_game_on_exec(new_pid, title_id, app_id, monotonic_time_us());
+    return false;
+  }
+
+  g_kstuff.game.pid = new_pid;
+  if (app_id != 0)
+    g_kstuff.game.app_id = app_id;
+  // The auto-pause state/deadline belongs to the application lifetime, not to
+  // the individual process. Only mdbg must follow the replacement PID.
+  sm_mdbg_game_on_exec(new_pid, title_id, g_kstuff.game.app_id);
+  log_debug("  [KSTUFF] process handoff: %s pid=%ld -> pid=%ld "
+            "(pause_applied=%s)",
+            title_id, (long)old_pid, (long)new_pid,
+            g_kstuff.game.pause_applied ? "yes" : "no");
+  return true;
+}
+
 void sm_kstuff_note_app_focus(uint32_t app_id) {
   atomic_store(&g_pending_app_focus_id, app_id);
   atomic_store(&g_pending_app_focus_valid, true);
@@ -802,11 +830,11 @@ void sm_kstuff_game_on_exit(pid_t pid) {
     finish_tracked_game_clear("tracked game exit");
 }
 
-void sm_kstuff_game_poll(void) {
+void sm_kstuff_game_poll(bool process_active) {
   if (atomic_exchange(&g_pending_config_reload, false))
     apply_kstuff_config_reload();
 
-  if (!sm_kstuff_game_feature_enabled())
+  if (!process_active || !sm_kstuff_game_feature_enabled())
     return;
 
   if (atomic_exchange(&g_pending_app_focus_valid, false)) {

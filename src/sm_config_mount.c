@@ -1,7 +1,14 @@
 #include "sm_platform.h"
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <pthread.h>
+#include <sys/socket.h>
+
+#include "sm_api_protocol.h"
 #include "sm_config_mount.h"
 #include "sm_types.h"
 #include "sm_limits.h"
+#include "sm_l10n.h"
 #include "sm_log.h"
 #include "sm_mount_defs.h"
 #include "sm_mount_device.h"
@@ -31,6 +38,7 @@ typedef struct {
   runtime_config_t cfg;
   char scan_path_storage[MAX_SCAN_PATHS][MAX_PATH];
   int scan_path_count;
+  int custom_scan_path_count;
   image_mode_rule_t image_mode_rules[MAX_IMAGE_MODE_RULES];
   char kstuff_no_pause_title_ids[MAX_KSTUFF_TITLE_RULES][MAX_TITLE_ID];
   int kstuff_no_pause_title_count;
@@ -61,6 +69,8 @@ static runtime_config_state_t
 static _Atomic int g_runtime_state_active_index = 0;
 static atomic_bool g_runtime_cfg_ready = false;
 static config_file_stamp_t g_config_file_stamp;
+static pthread_mutex_t g_autotune_file_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_config_file_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static char *trim_ascii(char *s);
 static bool parse_ini_line(char *line, char **key_out, char **value_out);
@@ -75,6 +85,9 @@ static bool add_global_fakelib_exclude_rule(runtime_config_state_t *state,
                                             const char *value);
 static bool normalize_image_filename_value(const char *value,
                                            char out[MAX_PATH]);
+static bool normalize_absolute_path_value(const char *value,
+                                          char out[MAX_PATH]);
+static bool normalize_http_url_value(const char *value, char out[MAX_PATH]);
 static bool set_image_sector_rule(runtime_config_state_t *state,
                                   const char *value);
 static bool parse_image_sector_rule_value(const char *value,
@@ -98,7 +111,20 @@ static bool lookup_kstuff_delay_override_in_file(const char *path,
 static bool upsert_kstuff_delay_override_in_file(const char *path,
                                                  const char *title_id,
                                                  uint32_t delay_seconds);
-static void apply_firmware_runtime_overrides(runtime_config_state_t *state);
+
+static bool web_managed_config_key(const char *key) {
+  return strcasecmp(key, "debug") == 0 ||
+         strcasecmp(key, "quiet_mode") == 0 ||
+         strcasecmp(key, "update_emulators") == 0 ||
+         strcasecmp(key, "fan_target_temperature") == 0 ||
+         strcasecmp(key, "api_bind_address") == 0 ||
+         strcasecmp(key, "api_bind_adress") == 0 ||
+         strcasecmp(key, "scanpath") == 0;
+}
+
+static int config_io_error(void) {
+  return errno != 0 ? errno : EIO;
+}
 
 static char *trim_ascii(char *s) {
   while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n')
@@ -152,19 +178,6 @@ static bool parse_ini_line(char *line, char **key_out, char **value_out) {
   return true;
 }
 
-static void apply_firmware_runtime_overrides(runtime_config_state_t *state) {
-  if (!state)
-    return;
-
-  if (sm_firmware_major_version() >= 12u) {
-    state->cfg.app_install_all_enabled = true;
-    state->cfg.app_install_all_forced = true;
-    return;
-  }
-
-  state->cfg.app_install_all_forced = false;
-}
-
 static const runtime_config_state_t *active_runtime_state(void) {
   return &g_runtime_state_slots[atomic_load_explicit(&g_runtime_state_active_index,
                                                      memory_order_acquire)];
@@ -188,6 +201,7 @@ static attach_backend_t default_ufs_backend(void) {
 
 static void clear_runtime_scan_paths(runtime_config_state_t *state) {
   state->scan_path_count = 0;
+  state->custom_scan_path_count = 0;
   memset(state->scan_path_storage, 0, sizeof(state->scan_path_storage));
 }
 
@@ -245,38 +259,54 @@ static void clear_kstuff_title_rules(runtime_config_state_t *state) {
 
 static void init_runtime_config_defaults(runtime_config_state_t *state) {
   memset(state, 0, sizeof(*state));
+  state->cfg.api_enabled = true;
   state->cfg.debug_enabled = true;
   state->cfg.quiet_mode = false;
   state->cfg.mount_read_only = (IMAGE_MOUNT_READ_ONLY != 0);
   state->cfg.force_mount = false;
+  state->cfg.persistent_image_mounts = false;
   state->cfg.app_install_all_enabled = false;
-  state->cfg.app_install_all_forced = false;
+  state->cfg.auto_remove_missing_games = false;
+  state->cfg.auto_remove_games_with_dlc = false;
   state->cfg.backport_fakelib_enabled = true;
   state->cfg.global_fakelib_enabled = true;
-  state->cfg.global_fakelib_mount_first = true;
+  state->cfg.global_fakelib_game_priority = true;
+  state->cfg.update_emulators_enabled = true;
+  state->cfg.auto_update_ampr_enabled = false;
   state->cfg.kstuff_game_auto_toggle = true;
   state->cfg.kstuff_crash_detection_enabled = true;
   state->cfg.legacy_recursive_scan_forced = false;
+  (void)strlcpy(state->cfg.api_bind_address, SM_API_DEFAULT_BIND_ADDRESS,
+                sizeof(state->cfg.api_bind_address));
+  state->cfg.api_port = SM_API_DEFAULT_PORT;
   (void)strlcpy(state->cfg.global_fakelib_path, DEFAULT_GLOBAL_FAKELIB_PATH,
                 sizeof(state->cfg.global_fakelib_path));
+  (void)strlcpy(state->cfg.emulators_path, DEFAULT_EMULATORS_PATH,
+                sizeof(state->cfg.emulators_path));
+  (void)strlcpy(state->cfg.ampr_update_url, DEFAULT_AMPR_UPDATE_URL,
+                sizeof(state->cfg.ampr_update_url));
   state->cfg.scan_depth = DEFAULT_SCAN_DEPTH;
   state->cfg.scan_interval_us = DEFAULT_SCAN_INTERVAL_US;
   state->cfg.stability_wait_seconds = DEFAULT_STABILITY_WAIT_SECONDS;
+  state->cfg.auto_remove_missing_delay_seconds =
+      DEFAULT_AUTO_REMOVE_MISSING_DELAY_SECONDS;
   state->cfg.kstuff_pause_delay_image_seconds =
       DEFAULT_KSTUFF_PAUSE_DELAY_IMAGE_SECONDS;
   state->cfg.kstuff_pause_delay_direct_seconds =
       DEFAULT_KSTUFF_PAUSE_DELAY_DIRECT_SECONDS;
+  state->cfg.fan_target_temperature_c = FAN_TARGET_TEMPERATURE_SYSTEM;
+  state->cfg.language_id = SM_LANGUAGE_AUTO;
   state->cfg.exfat_backend = default_exfat_backend();
   state->cfg.ufs_backend = default_ufs_backend();
+  state->cfg.nested_pfs_index_cache_enabled = false;
   state->cfg.lvd_sector_exfat = LVD_SECTOR_SIZE_EXFAT;
   state->cfg.lvd_sector_ufs = LVD_SECTOR_SIZE_UFS;
   state->cfg.lvd_sector_pfs = LVD_SECTOR_SIZE_PFS;
   state->cfg.md_sector_exfat = MD_SECTOR_SIZE_EXFAT;
-  state->cfg.md_sector_ufs = MD_SECTOR_SIZE_UFS;
+  state->cfg.md_sector_ufs = MD_SECTOR_SIZE_UFS_OPTIMIZED;
   memset(state->image_mode_rules, 0, sizeof(state->image_mode_rules));
   clear_kstuff_title_rules(state);
   init_runtime_scan_paths_defaults(state);
-  apply_firmware_runtime_overrides(state);
 }
 
 static config_file_stamp_t read_config_file_stamp(void) {
@@ -309,6 +339,7 @@ static void apply_reloadable_runtime_fields(runtime_config_state_t *dst,
                                             const runtime_config_state_t *src) {
   dst->cfg = src->cfg;
   dst->scan_path_count = src->scan_path_count;
+  dst->custom_scan_path_count = src->custom_scan_path_count;
   memcpy(dst->scan_path_storage, src->scan_path_storage,
          sizeof(dst->scan_path_storage));
   memcpy(dst->image_mode_rules, src->image_mode_rules,
@@ -358,6 +389,19 @@ const char *get_scan_path(int index) {
   return state->scan_path_storage[index];
 }
 
+int get_custom_scan_path_count(void) {
+  ensure_runtime_config_ready();
+  return active_runtime_state()->custom_scan_path_count;
+}
+
+const char *get_custom_scan_path(int index) {
+  ensure_runtime_config_ready();
+  const runtime_config_state_t *state = active_runtime_state();
+  if (index < 0 || index >= state->custom_scan_path_count)
+    return NULL;
+  return state->scan_path_storage[index];
+}
+
 uint32_t get_scan_depth_for_root(const char *scan_path) {
   uint32_t scan_depth = runtime_config()->scan_depth;
   if (scan_depth < MIN_SCAN_DEPTH)
@@ -397,8 +441,11 @@ bool get_image_sector_size_override(const char *filename,
   if (!filename || !sector_size_out)
     return false;
 
-  if (lookup_image_sector_override_in_file(AUTOTUNE_FILE, filename,
-                                           sector_size_out)) {
+  pthread_mutex_lock(&g_autotune_file_mutex);
+  bool autotuned = lookup_image_sector_override_in_file(
+      AUTOTUNE_FILE, filename, sector_size_out);
+  pthread_mutex_unlock(&g_autotune_file_mutex);
+  if (autotuned) {
     return true;
   }
 
@@ -478,8 +525,11 @@ bool get_kstuff_pause_delay_override_for_title(const char *title_id,
 
 bool get_kstuff_autotune_pause_delay_for_title(const char *title_id,
                                                uint32_t *delay_seconds_out) {
-  return lookup_kstuff_delay_override_in_file(AUTOTUNE_FILE, title_id,
-                                              delay_seconds_out);
+  pthread_mutex_lock(&g_autotune_file_mutex);
+  bool found = lookup_kstuff_delay_override_in_file(
+      AUTOTUNE_FILE, title_id, delay_seconds_out);
+  pthread_mutex_unlock(&g_autotune_file_mutex);
+  return found;
 }
 
 bool upsert_kstuff_autotune_pause_delay(const char *title_id,
@@ -497,8 +547,11 @@ bool upsert_kstuff_autotune_pause_delay(const char *title_id,
     tuned_delay_seconds = 1;
   if (tuned_delay_seconds > MAX_KSTUFF_PAUSE_DELAY_SECONDS)
     tuned_delay_seconds = MAX_KSTUFF_PAUSE_DELAY_SECONDS;
-  if (!upsert_kstuff_delay_override_in_file(AUTOTUNE_FILE, normalized,
-                                            (uint32_t)tuned_delay_seconds)) {
+  pthread_mutex_lock(&g_autotune_file_mutex);
+  bool updated = upsert_kstuff_delay_override_in_file(
+      AUTOTUNE_FILE, normalized, (uint32_t)tuned_delay_seconds);
+  pthread_mutex_unlock(&g_autotune_file_mutex);
+  if (!updated) {
     return false;
   }
   if (delay_seconds_out)
@@ -518,8 +571,11 @@ bool upsert_image_sector_size_autotune(const char *filename,
   if (!normalize_image_filename_value(filename, normalized_filename))
     return false;
 
-  if (!upsert_image_sector_override_in_file(AUTOTUNE_FILE, normalized_filename,
-                                            sector_size)) {
+  pthread_mutex_lock(&g_autotune_file_mutex);
+  bool updated = upsert_image_sector_override_in_file(
+      AUTOTUNE_FILE, normalized_filename, sector_size);
+  pthread_mutex_unlock(&g_autotune_file_mutex);
+  if (!updated) {
     return false;
   }
 
@@ -567,6 +623,66 @@ static bool normalize_image_filename_value(const char *value,
     return false;
 
   (void)strlcpy(out, filename, MAX_PATH);
+  return true;
+}
+
+static bool normalize_absolute_path_value(const char *value,
+                                          char out[MAX_PATH]) {
+  if (!value || !out)
+    return false;
+
+  char local[MAX_PATH];
+  if (strlcpy(local, value, sizeof(local)) >= sizeof(local))
+    return false;
+
+  char *trimmed = trim_ascii(local);
+  size_t len = strlen(trimmed);
+  if (len == 0 || len >= MAX_PATH || trimmed[0] != '/')
+    return false;
+  for (size_t i = 0; i < len; ++i) {
+    if (iscntrl((unsigned char)trimmed[i]) || trimmed[i] == '#')
+      return false;
+  }
+
+  while (len > 1 && trimmed[len - 1] == '/') {
+    trimmed[len - 1] = '\0';
+    len--;
+  }
+
+  (void)strlcpy(out, trimmed, MAX_PATH);
+  return true;
+}
+
+static bool normalize_http_url_value(const char *value, char out[MAX_PATH]) {
+  if (!value || !out)
+    return false;
+
+  char local[MAX_PATH];
+  if (strlcpy(local, value, sizeof(local)) >= sizeof(local))
+    return false;
+
+  char *trimmed = trim_ascii(local);
+  size_t len = strlen(trimmed);
+  const char *authority = NULL;
+  if (strncasecmp(trimmed, "https://", 8) == 0)
+    authority = trimmed + 8;
+  else if (strncasecmp(trimmed, "http://", 7) == 0)
+    authority = trimmed + 7;
+  else
+    return false;
+  if (*authority == '\0' || *authority == '/' || *authority == '?' ||
+      *authority == '#') {
+    return false;
+  }
+
+  for (size_t i = 0; i < len; ++i) {
+    if (iscntrl((unsigned char)trimmed[i]) ||
+        isspace((unsigned char)trimmed[i])) {
+      return false;
+    }
+  }
+
+  (void)strlcpy(out, trimmed, MAX_PATH);
   return true;
 }
 
@@ -1171,6 +1287,56 @@ static config_load_status_t load_runtime_config_state(runtime_config_state_t *st
       continue;
     }
 
+    if (strcasecmp(key, "language") == 0 || strcasecmp(key, "lang") == 0 ||
+        strcasecmp(key, "locale") == 0) {
+      int32_t language_id = SM_LANGUAGE_AUTO;
+      if (!sm_l10n_parse_language_id(value, &language_id)) {
+        log_debug("  [CFG] invalid language at line %d: %s=%s "
+                  "(use auto or a supported locale like en-US, ru-RU)",
+                  line_no, key, value);
+        continue;
+      }
+      state->cfg.language_id = language_id;
+      continue;
+    }
+
+    if (strcasecmp(key, "api_enabled") == 0) {
+      if (!parse_bool_ini(value, &bval)) {
+        log_debug("  [CFG] invalid bool at line %d: %s=%s", line_no, key,
+                  value);
+        continue;
+      }
+      state->cfg.api_enabled = bval;
+      continue;
+    }
+
+    if (strcasecmp(key, "api_bind_address") == 0 ||
+        strcasecmp(key, "api_bind_adress") == 0) {
+      struct in_addr address;
+      if (strlen(value) >= sizeof(state->cfg.api_bind_address) ||
+          inet_pton(AF_INET, value, &address) != 1) {
+        log_debug("  [CFG] invalid API IPv4 address at line %d: %s=%s",
+                  line_no, key, value);
+        continue;
+      }
+      if (strcasecmp(key, "api_bind_adress") == 0)
+        log_debug("  [CFG] legacy api_bind_adress at line %d; use "
+                  "api_bind_address", line_no);
+      (void)strlcpy(state->cfg.api_bind_address, value,
+                    sizeof(state->cfg.api_bind_address));
+      continue;
+    }
+
+    if (strcasecmp(key, "api_port") == 0) {
+      if (!parse_u32_ini(value, &u32) || u32 == 0 || u32 > 65535u) {
+        log_debug("  [CFG] invalid API port at line %d: %s=%s (range: 1..65535)",
+                  line_no, key, value);
+        continue;
+      }
+      state->cfg.api_port = u32;
+      continue;
+    }
+
     if (strcasecmp(key, "mount_read_only") == 0 ||
         strcasecmp(key, "read_only") == 0) {
       if (!parse_bool_ini(value, &bval)) {
@@ -1190,13 +1356,39 @@ static config_load_status_t load_runtime_config_state(runtime_config_state_t *st
       continue;
     }
 
+    if (strcasecmp(key, "persistent_image_mounts") == 0) {
+      if (!parse_bool_ini(value, &bval)) {
+        log_debug("  [CFG] invalid bool at line %d: %s=%s", line_no, key, value);
+        continue;
+      }
+      state->cfg.persistent_image_mounts = bval;
+      continue;
+    }
+
     if (strcasecmp(key, "app_install_all") == 0) {
       if (!parse_bool_ini(value, &bval)) {
         log_debug("  [CFG] invalid bool at line %d: %s=%s", line_no, key, value);
         continue;
       }
       state->cfg.app_install_all_enabled = bval;
-      state->cfg.app_install_all_forced = false;
+      continue;
+    }
+
+    if (strcasecmp(key, "auto_remove_missing_games") == 0) {
+      if (!parse_bool_ini(value, &bval)) {
+        log_debug("  [CFG] invalid bool at line %d: %s=%s", line_no, key, value);
+        continue;
+      }
+      state->cfg.auto_remove_missing_games = bval;
+      continue;
+    }
+
+    if (strcasecmp(key, "auto_remove_games_with_dlc") == 0) {
+      if (!parse_bool_ini(value, &bval)) {
+        log_debug("  [CFG] invalid bool at line %d: %s=%s", line_no, key, value);
+        continue;
+      }
+      state->cfg.auto_remove_games_with_dlc = bval;
       continue;
     }
 
@@ -1261,34 +1453,22 @@ static config_load_status_t load_runtime_config_state(runtime_config_state_t *st
     }
 
     if (strcasecmp(key, "global_fakelib_path") == 0) {
-      char local[MAX_PATH];
-      if (strlcpy(local, value, sizeof(local)) >= sizeof(local)) {
+      char path[MAX_PATH];
+      if (!normalize_absolute_path_value(value, path)) {
         log_debug("  [CFG] invalid global fakelib path at line %d: %s=%s",
                   line_no, key, value);
         continue;
       }
-      char *trimmed = trim_ascii(local);
-      size_t len = strlen(trimmed);
-      if (len == 0 || len >= MAX_PATH || trimmed[0] != '/') {
-        log_debug("  [CFG] invalid global fakelib path at line %d: %s=%s",
-                  line_no, key, value);
-        continue;
-      }
-      while (len > 1 && trimmed[len - 1] == '/') {
-        trimmed[len - 1] = '\0';
-        len--;
-      }
-      (void)strlcpy(state->cfg.global_fakelib_path, trimmed,
+      (void)strlcpy(state->cfg.global_fakelib_path, path,
                     sizeof(state->cfg.global_fakelib_path));
       continue;
     }
 
     if (strcasecmp(key, "global_fakelib_priority") == 0) {
-      // Lower-priority overlay must be mounted first.
       if (strcasecmp(value, "game") == 0) {
-        state->cfg.global_fakelib_mount_first = true;
+        state->cfg.global_fakelib_game_priority = true;
       } else if (strcasecmp(value, "global") == 0) {
-        state->cfg.global_fakelib_mount_first = false;
+        state->cfg.global_fakelib_game_priority = false;
       } else {
         log_debug("  [CFG] invalid global fakelib priority at line %d: %s=%s "
                   "(use game or global)",
@@ -1323,6 +1503,68 @@ static config_load_status_t load_runtime_config_state(runtime_config_state_t *st
         continue;
       }
       state->cfg.kstuff_crash_detection_enabled = bval;
+      continue;
+    }
+
+    if (strcasecmp(key, "update_emulators") == 0) {
+      if (!parse_bool_ini(value, &bval)) {
+        log_debug("  [CFG] invalid bool at line %d: %s=%s", line_no, key, value);
+        continue;
+      }
+      state->cfg.update_emulators_enabled = bval;
+      continue;
+    }
+
+    if (strcasecmp(key, "emulators_path") == 0) {
+      char path[MAX_PATH];
+      if (!normalize_absolute_path_value(value, path)) {
+        log_debug("  [CFG] invalid emulator path at line %d: %s=%s",
+                  line_no, key, value);
+        continue;
+      }
+      (void)strlcpy(state->cfg.emulators_path, path,
+                    sizeof(state->cfg.emulators_path));
+      continue;
+    }
+
+    if (strcasecmp(key, "auto_update_ampr") == 0) {
+      if (!parse_bool_ini(value, &bval)) {
+        log_debug("  [CFG] invalid bool at line %d: %s=%s", line_no, key, value);
+        continue;
+      }
+      state->cfg.auto_update_ampr_enabled = bval;
+      continue;
+    }
+
+    if (strcasecmp(key, "ampr_update_url") == 0) {
+      char url[MAX_PATH];
+      if (!normalize_http_url_value(value, url)) {
+        log_debug("  [CFG] invalid AMPR update URL at line %d: %s=%s "
+                  "(HTTP or HTTPS required)",
+                  line_no, key, value);
+        continue;
+      }
+      (void)strlcpy(state->cfg.ampr_update_url, url,
+                    sizeof(state->cfg.ampr_update_url));
+      continue;
+    }
+
+    if (strcasecmp(key, "fan_target_temperature") == 0) {
+      if (strcasecmp(value, "system") == 0 ||
+          strcasecmp(value, "auto") == 0) {
+        state->cfg.fan_target_temperature_c = FAN_TARGET_TEMPERATURE_SYSTEM;
+      } else if (!parse_u32_ini(value, &u32) ||
+                 u32 < MIN_FAN_TARGET_TEMPERATURE_C ||
+                 u32 > MAX_FAN_TARGET_TEMPERATURE_C) {
+        log_debug("  [CFG] invalid fan target at line %d: %s=%s "
+                  "(use system or %u..%u C)",
+                  line_no, key, value,
+                  (unsigned)MIN_FAN_TARGET_TEMPERATURE_C,
+                  (unsigned)MAX_FAN_TARGET_TEMPERATURE_C);
+        continue;
+      } else {
+        state->cfg.fan_target_temperature_c = u32;
+      }
       continue;
     }
 
@@ -1368,6 +1610,22 @@ static config_load_status_t load_runtime_config_state(runtime_config_state_t *st
       continue;
     }
 
+    if (strcasecmp(key, "auto_remove_missing_delay_seconds") == 0 ||
+        strcasecmp(key, "auto_remove_missing_delay_sec") == 0) {
+      if (!parse_u32_ini(value, &u32) ||
+          u32 < MIN_AUTO_REMOVE_MISSING_DELAY_SECONDS ||
+          u32 > MAX_AUTO_REMOVE_MISSING_DELAY_SECONDS) {
+        log_debug("  [CFG] invalid auto-remove delay at line %d: %s=%s "
+                  "(range: %u..%u)",
+                  line_no, key, value,
+                  (unsigned)MIN_AUTO_REMOVE_MISSING_DELAY_SECONDS,
+                  (unsigned)MAX_AUTO_REMOVE_MISSING_DELAY_SECONDS);
+        continue;
+      }
+      state->cfg.auto_remove_missing_delay_seconds = u32;
+      continue;
+    }
+
     if (strcasecmp(key, "kstuff_pause_delay_image_seconds") == 0 ||
         strcasecmp(key, "kstuff_pause_delay_image_sec") == 0) {
       if (!parse_u32_ini(value, &u32) || u32 > MAX_KSTUFF_PAUSE_DELAY_SECONDS) {
@@ -1409,6 +1667,17 @@ static config_load_status_t load_runtime_config_state(runtime_config_state_t *st
         continue;
       }
       state->cfg.ufs_backend = backend;
+      continue;
+    }
+
+    if (strcasecmp(key, "nested_pfs_index_cache") == 0 ||
+        strcasecmp(key, "legacy_gddr5_cache") == 0) {
+      if (!parse_bool_ini(value, &bval)) {
+        log_debug("  [CFG] invalid bool at line %d: %s=%s", line_no, key,
+                  value);
+        continue;
+      }
+      state->cfg.nested_pfs_index_cache_enabled = bval;
       continue;
     }
 
@@ -1460,6 +1729,8 @@ static config_load_status_t load_runtime_config_state(runtime_config_state_t *st
   if (has_custom_scanpaths && state->scan_path_count == 0) {
     log_debug("  [CFG] no valid scanpath entries, using defaults");
     init_runtime_scan_paths_defaults(state);
+  } else if (has_custom_scanpaths) {
+    state->custom_scan_path_count = state->scan_path_count;
   }
   add_runtime_managed_scan_paths(state);
 
@@ -1469,7 +1740,6 @@ static config_load_status_t load_runtime_config_state(runtime_config_state_t *st
     log_debug("  [CFG] recursive_scan=1 is deprecated; forcing scan_depth=2");
   }
 
-  apply_firmware_runtime_overrides(state);
 
   int image_rule_count = 0;
   for (int k = 0; k < MAX_IMAGE_MODE_RULES; k++) {
@@ -1483,34 +1753,55 @@ static config_load_status_t load_runtime_config_state(runtime_config_state_t *st
       kstuff_delay_rule_count++;
   }
 
-  log_debug("  [CFG] loaded: debug=%d quiet=%d ro=%d force=%d "
-            "app_install_all=%d app_install_all_forced=%d scan_depth=%u "
+  log_debug("  [CFG] loaded: api_enabled=%d debug=%d quiet=%d language=%s "
+            "ro=%d force=%d "
+            "persistent_image_mounts=%d app_install_all=%d "
+            "auto_remove_missing_games=%d "
+            "auto_remove_games_with_dlc=%d auto_remove_missing_delay_s=%u "
+            "api=%s:%u scan_depth=%u "
             "legacy_recursive_scan_forced=%d backport_fakelib=%d "
             "global_fakelib=%d global_fakelib_priority=%s "
             "global_fakelib_path=%s global_fakelib_exclude=%u "
+            "update_emulators=%d emulators_path=%s auto_update_ampr=%d "
+            "ampr_update_url=%s "
             "kstuff_game_auto_toggle=%d kstuff_crash_detection=%d "
+            "fan_target_temperature=%u (0=system) "
             "kstuff_pause_delay_image_s=%u kstuff_pause_delay_direct_s=%u "
             "exfat_backend=%s ufs_backend=%s "
+            "nested_pfs_index_cache=%d "
             "lvd_sec(exfat=%u ufs=%u pfs=%u) md_sec(exfat=%u ufs=%u) "
             "scan_interval_s=%u stability_wait_s=%u scan_paths=%d image_rules=%d "
             "kstuff_no_pause=%d kstuff_delay_rules=%d",
+            state->cfg.api_enabled ? 1 : 0,
             state->cfg.debug_enabled ? 1 : 0, state->cfg.quiet_mode ? 1 : 0,
+            sm_l10n_language_name(state->cfg.language_id),
             state->cfg.mount_read_only ? 1 : 0,
             state->cfg.force_mount ? 1 : 0,
+            state->cfg.persistent_image_mounts ? 1 : 0,
             state->cfg.app_install_all_enabled ? 1 : 0,
-            state->cfg.app_install_all_forced ? 1 : 0, state->cfg.scan_depth,
+            state->cfg.auto_remove_missing_games ? 1 : 0,
+            state->cfg.auto_remove_games_with_dlc ? 1 : 0,
+            state->cfg.auto_remove_missing_delay_seconds,
+            state->cfg.api_bind_address, state->cfg.api_port,
+            state->cfg.scan_depth,
             state->cfg.legacy_recursive_scan_forced ? 1 : 0,
             state->cfg.backport_fakelib_enabled ? 1 : 0,
             state->cfg.global_fakelib_enabled ? 1 : 0,
-            state->cfg.global_fakelib_mount_first ? "game" : "global",
+            state->cfg.global_fakelib_game_priority ? "game" : "global",
             state->cfg.global_fakelib_path,
             state->cfg.global_fakelib_exclude_title_count,
+            state->cfg.update_emulators_enabled ? 1 : 0,
+            state->cfg.emulators_path,
+            state->cfg.auto_update_ampr_enabled ? 1 : 0,
+            state->cfg.ampr_update_url,
             state->cfg.kstuff_game_auto_toggle ? 1 : 0,
             state->cfg.kstuff_crash_detection_enabled ? 1 : 0,
+            state->cfg.fan_target_temperature_c,
             state->cfg.kstuff_pause_delay_image_seconds,
             state->cfg.kstuff_pause_delay_direct_seconds,
             attach_backend_name(state->cfg.exfat_backend),
             attach_backend_name(state->cfg.ufs_backend),
+            state->cfg.nested_pfs_index_cache_enabled ? 1 : 0,
             state->cfg.lvd_sector_exfat, state->cfg.lvd_sector_ufs,
             state->cfg.lvd_sector_pfs, state->cfg.md_sector_exfat,
             state->cfg.md_sector_ufs, state->cfg.scan_interval_us / 1000000u,
@@ -1558,5 +1849,167 @@ bool reload_runtime_config_if_changed(bool *reloaded_out) {
   activate_runtime_config_state(candidate_slot);
   if (reloaded_out)
     *reloaded_out = true;
+  return true;
+}
+
+bool sm_config_write_web_settings(bool debug_enabled, bool quiet_mode,
+                                  bool update_emulators_enabled,
+                                  bool allow_lan_access,
+                                  uint32_t fan_target_temperature_c,
+                                  const char *const *scan_paths,
+                                  size_t scan_path_count) {
+  if ((fan_target_temperature_c != FAN_TARGET_TEMPERATURE_SYSTEM &&
+       (fan_target_temperature_c < MIN_FAN_TARGET_TEMPERATURE_C ||
+        fan_target_temperature_c > MAX_FAN_TARGET_TEMPERATURE_C)) ||
+      scan_path_count > MAX_SCAN_PATHS ||
+      (scan_path_count > 0 && !scan_paths)) {
+    errno = EINVAL;
+    return false;
+  }
+
+  char(*normalized_paths)[MAX_PATH] =
+      scan_path_count > 0 ? calloc(scan_path_count, MAX_PATH) : NULL;
+  if (scan_path_count > 0 && !normalized_paths) {
+    errno = ENOMEM;
+    return false;
+  }
+  size_t normalized_count = 0;
+  for (size_t i = 0; i < scan_path_count; ++i) {
+    char path[MAX_PATH];
+    if (!normalize_absolute_path_value(scan_paths[i], path) ||
+        strcmp(path, "/") == 0 ||
+        is_under_image_mount_base(path)) {
+      free(normalized_paths);
+      errno = EINVAL;
+      return false;
+    }
+    bool duplicate = false;
+    for (size_t j = 0; j < normalized_count; ++j) {
+      if (strcmp(normalized_paths[j], path) == 0) {
+        duplicate = true;
+        break;
+      }
+    }
+    if (!duplicate) {
+      (void)strlcpy(normalized_paths[normalized_count], path, MAX_PATH);
+      normalized_count++;
+    }
+  }
+
+  pthread_mutex_lock(&g_config_file_mutex);
+  (void)mkdir(LOG_DIR, 0777);
+  FILE *in = fopen(CONFIG_FILE, "r");
+  if (!in && errno != ENOENT) {
+    int saved_errno = config_io_error();
+    pthread_mutex_unlock(&g_config_file_mutex);
+    free(normalized_paths);
+    errno = saved_errno;
+    return false;
+  }
+
+  char temp_path[MAX_PATH];
+  int temp_written = snprintf(temp_path, sizeof(temp_path), "%s.web.tmp",
+                              CONFIG_FILE);
+  if (temp_written < 0 || (size_t)temp_written >= sizeof(temp_path)) {
+    if (in)
+      (void)fclose(in);
+    pthread_mutex_unlock(&g_config_file_mutex);
+    free(normalized_paths);
+    errno = ENAMETOOLONG;
+    return false;
+  }
+  (void)unlink(temp_path);
+  FILE *out = fopen(temp_path, "w");
+  if (!out) {
+    int saved_errno = config_io_error();
+    if (in)
+      (void)fclose(in);
+    pthread_mutex_unlock(&g_config_file_mutex);
+    free(normalized_paths);
+    errno = saved_errno;
+    return false;
+  }
+
+  errno = 0;
+  int saved_errno = 0;
+  int last_written = '\n';
+  char line[MAX_PATH + 256u];
+  while (in && fgets(line, sizeof(line), in)) {
+    bool truncated = strchr(line, '\n') == NULL && !feof(in);
+    char parsed[sizeof(line)];
+    (void)strlcpy(parsed, line, sizeof(parsed));
+    char *key = NULL;
+    char *value = NULL;
+    char *trimmed = trim_ascii(parsed);
+    bool skip = strcmp(trimmed,
+                       "# Managed by the ShadowMount web interface.") == 0;
+    if (!skip)
+      skip = parse_ini_line(parsed, &key, &value) &&
+             web_managed_config_key(key);
+    if (!skip && fputs(line, out) == EOF) {
+      saved_errno = config_io_error();
+      break;
+    }
+    if (!skip && line[0] != '\0')
+      last_written = (unsigned char)line[strlen(line) - 1u];
+    if (!truncated)
+      continue;
+    int ch;
+    while ((ch = fgetc(in)) != EOF) {
+      if (!skip && fputc(ch, out) == EOF && saved_errno == 0)
+        saved_errno = config_io_error();
+      if (!skip)
+        last_written = ch;
+      if (ch == '\n')
+        break;
+    }
+    if (saved_errno != 0)
+      break;
+  }
+  if (in && ferror(in) && saved_errno == 0)
+    saved_errno = config_io_error();
+  if (saved_errno == 0 && last_written != '\n' && fputc('\n', out) == EOF)
+    saved_errno = config_io_error();
+  if (saved_errno == 0 &&
+      fprintf(out,
+              "\n# Managed by the ShadowMount web interface.\n"
+              "debug=%u\nquiet_mode=%u\nupdate_emulators=%u\n"
+              "api_bind_address=%s\n",
+              debug_enabled ? 1u : 0u, quiet_mode ? 1u : 0u,
+              update_emulators_enabled ? 1u : 0u,
+              allow_lan_access ? "0.0.0.0" : "127.0.0.1") < 0) {
+    saved_errno = config_io_error();
+  }
+  if (saved_errno == 0) {
+    if (fan_target_temperature_c == FAN_TARGET_TEMPERATURE_SYSTEM) {
+      if (fputs("fan_target_temperature=system\n", out) == EOF)
+        saved_errno = config_io_error();
+    } else if (fprintf(out, "fan_target_temperature=%u\n",
+                       fan_target_temperature_c) < 0) {
+      saved_errno = config_io_error();
+    }
+  }
+  for (size_t i = 0; saved_errno == 0 && i < normalized_count; ++i) {
+    if (fprintf(out, "scanpath=%s\n", normalized_paths[i]) < 0)
+      saved_errno = config_io_error();
+  }
+  if (fflush(out) != 0 && saved_errno == 0)
+    saved_errno = config_io_error();
+  if (saved_errno == 0 && fsync(fileno(out)) != 0)
+    saved_errno = config_io_error();
+  if (fclose(out) != 0 && saved_errno == 0)
+    saved_errno = config_io_error();
+  if (in && fclose(in) != 0 && saved_errno == 0)
+    saved_errno = config_io_error();
+  if (saved_errno == 0 && rename(temp_path, CONFIG_FILE) != 0)
+    saved_errno = config_io_error();
+  if (saved_errno != 0)
+    (void)unlink(temp_path);
+  pthread_mutex_unlock(&g_config_file_mutex);
+  free(normalized_paths);
+  if (saved_errno != 0) {
+    errno = saved_errno;
+    return false;
+  }
   return true;
 }

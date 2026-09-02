@@ -135,8 +135,7 @@ void notify_duplicate_title_once(const char *title_id, const char *path_a,
   if (entry->duplicate_notified_once)
     return;
   entry->duplicate_notified_once = true;
-  notify_system("Duplicate %s ignored:\n%s\nexisting: %s", title_id, path_a,
-                path_b);
+  notify_system_l10n(SM_L10N_DUPLICATE_IGNORED, title_id, path_a, path_b);
 }
 
 void clear_duplicate_title_notification(const char *title_id) {
@@ -161,4 +160,39 @@ uint8_t bump_failed_mount_attempts(const char *title_id) {
   if (entry->mount_reg_attempts < UINT8_MAX)
     entry->mount_reg_attempts++;
   return entry->mount_reg_attempts;
+}
+
+void reset_title_attempts(const char *title_id,
+                          uint8_t *register_attempts_out,
+                          uint8_t *mount_install_attempts_out) {
+  if (register_attempts_out)
+    *register_attempts_out = 0;
+  if (mount_install_attempts_out)
+    *mount_install_attempts_out = 0;
+  if (!title_id || title_id[0] == '\0')
+    return;
+
+  struct TitleStateEntry *entry = find_title_state(title_id);
+  if (entry) {
+    if (register_attempts_out)
+      *register_attempts_out = entry->register_attempts;
+    if (mount_install_attempts_out)
+      *mount_install_attempts_out = entry->mount_reg_attempts;
+    entry->register_attempts = 0;
+    entry->mount_reg_attempts = 0;
+  }
+}
+
+size_t reset_all_title_attempts(void) {
+  size_t reset_count = 0;
+  for (int k = 0; k < TITLE_STATE_CAPACITY; k++) {
+    struct TitleStateEntry *entry = &g_title_state[k];
+    if (!entry->valid ||
+        (entry->register_attempts == 0 && entry->mount_reg_attempts == 0))
+      continue;
+    entry->register_attempts = 0;
+    entry->mount_reg_attempts = 0;
+    reset_count++;
+  }
+  return reset_count;
 }

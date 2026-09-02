@@ -1,13 +1,13 @@
 #include "sm_platform.h"
 
+#include <stdatomic.h>
+
 #include <pthread.h>
 
 #include "sm_game_lifecycle.h"
-#include "sm_kstuff.h"
 #include "sm_limits.h"
 #include "sm_log.h"
 #include "sm_runtime.h"
-#include "sm_scan.h"
 #include "sm_shellcore_flags.h"
 
 #define SHELLCORE_FLAG_WAITMODE_OR 2u
@@ -64,7 +64,7 @@ static pthread_cond_t g_shellcore_flag_cond = PTHREAD_COND_INITIALIZER;
 static bool g_shellcore_flag_thread_started = false;
 static bool g_shellcore_flag_start_ready = false;
 static bool g_shellcore_flag_start_success = false;
-static volatile sig_atomic_t g_shellcore_flag_stop_requested = 0;
+static atomic_bool g_shellcore_flag_stop_requested = false;
 
 static const shellcore_flag_bit_desc_t g_system_state_mgr_status_bits[] = {
     {0x0000000000000001ULL, "CEC_ONE_TOUCH_PLAY_COMMAND"},
@@ -509,11 +509,7 @@ static void set_shellcore_flag_start_result(bool success) {
 }
 
 static void enter_sleep_mode_and_cleanup(const char *reason) {
-  if (request_runtime_sleep_mode(true, reason)) {
-    runtime_mount_state_lock();
-    unmount_usb_sources_for_suspend();
-    runtime_mount_state_unlock();
-  }
+  (void)request_runtime_sleep_mode(true, reason);
 }
 
 static void reset_shellcore_flag_state(shellcore_flag_monitor_t *flag) {
@@ -621,14 +617,13 @@ static void poll_shellcore_flag(shellcore_flag_monitor_t *flag) {
   uint64_t result_pattern = 0;
   int rc;
   bool changed = false;
+  bool publish_app_focus = false;
   bool entered_shutdown_on_going = false;
   bool entered_main_on_standby = false;
   bool entered_suspend_on_going = false;
   bool entered_resume_working = false;
   bool entered_shellui_shutdown_in_progress = false;
   bool is_system_state_mgr_info = false;
-  unsigned current_state = 0;
-  unsigned previous_state = 0;
 
   if (!flag || !flag->is_open)
     return;
@@ -653,8 +648,8 @@ static void poll_shellcore_flag(shellcore_flag_monitor_t *flag) {
 
   is_system_state_mgr_info = strcmp(flag->name, "SceSystemStateMgrInfo") == 0;
   if (is_system_state_mgr_info) {
-    current_state = (unsigned)(result_pattern & 0xFFFFu);
-    previous_state =
+    unsigned current_state = (unsigned)(result_pattern & 0xFFFFu);
+    unsigned previous_state =
         flag->has_last_pattern ? (unsigned)(flag->last_pattern & 0xFFFFu) : 0;
 
     entered_shutdown_on_going =
@@ -682,14 +677,16 @@ static void poll_shellcore_flag(shellcore_flag_monitor_t *flag) {
           SYSTEM_STATE_MGR_STATUS_SHELLUI_SHUTDOWN_IN_PROGRESS) == 0);
   }
 
+  publish_app_focus =
+      strcmp(flag->name, "SceShellCoreUtilAppFocus") == 0 &&
+      (!flag->has_last_pattern || changed);
   flag->last_pattern = result_pattern;
   flag->has_last_pattern = true;
   flag->last_rc = 0;
   flag->has_last_rc = true;
 
-  if (changed && strcmp(flag->name, "SceShellCoreUtilAppFocus") == 0) {
-    sm_kstuff_note_app_focus((uint32_t)result_pattern);
-    wake_game_lifecycle_watcher();
+  if (publish_app_focus) {
+    sm_game_lifecycle_note_app_focus((uint32_t)result_pattern);
   }
   if (entered_shutdown_on_going) {
     request_shutdown_stop("SceSystemStateMgrInfo=SHUTDOWN_ON_GOING");
@@ -705,7 +702,6 @@ static void poll_shellcore_flag(shellcore_flag_monitor_t *flag) {
         "SceSystemStateMgrStatus=SHELLUI_SHUTDOWN_IN_PROGRESS");
   }
   if (entered_resume_working) {
-    request_scan_now("SceSystemStateMgrInfo=WORKING");
     request_runtime_sleep_mode(false, "SceSystemStateMgrInfo=WORKING");
   }
 }
@@ -721,8 +717,11 @@ static void *shellcore_flag_thread_main(void *arg) {
     return NULL;
   }
 
-  for (size_t i = 0; i < sizeof(g_shellcore_flags) / sizeof(g_shellcore_flags[0]);
-       ++i) {
+  shellcore_flag_monitor_t *resume_flag = NULL;
+  for (size_t i = 0;
+       i < sizeof(g_shellcore_flags) / sizeof(g_shellcore_flags[0]); ++i) {
+    if (strcmp(g_shellcore_flags[i].name, "SceSystemStateMgrInfo") == 0)
+      resume_flag = &g_shellcore_flags[i];
     poll_shellcore_flag(&g_shellcore_flags[i]);
   }
 
@@ -730,13 +729,21 @@ static void *shellcore_flag_thread_main(void *arg) {
             sizeof(g_shellcore_flags) / sizeof(g_shellcore_flags[0]));
   set_shellcore_flag_start_result(true);
 
-  while (!g_shellcore_flag_stop_requested && !should_stop_requested()) {
-    for (size_t i = 0; i < sizeof(g_shellcore_flags) / sizeof(g_shellcore_flags[0]);
-         ++i) {
-      poll_shellcore_flag(&g_shellcore_flags[i]);
+  while (!atomic_load_explicit(&g_shellcore_flag_stop_requested,
+                               memory_order_relaxed) &&
+         !should_stop_requested()) {
+    bool sleeping = runtime_sleep_mode_active();
+    if (sleeping && resume_flag) {
+      poll_shellcore_flag(resume_flag);
+    } else {
+      for (size_t i = 0;
+           i < sizeof(g_shellcore_flags) / sizeof(g_shellcore_flags[0]); ++i) {
+        poll_shellcore_flag(&g_shellcore_flags[i]);
+      }
     }
 
-    sceKernelUsleep(SHELLCORE_FLAG_POLL_INTERVAL_US);
+    sceKernelUsleep(sleeping ? SHELLCORE_FLAG_SLEEP_POLL_INTERVAL_US
+                             : SHELLCORE_FLAG_POLL_INTERVAL_US);
   }
 
   close_shellcore_flags();
@@ -749,7 +756,8 @@ bool sm_shellcore_flags_start(void) {
   if (g_shellcore_flag_thread_started)
     return g_shellcore_flag_start_success;
 
-  g_shellcore_flag_stop_requested = 0;
+  atomic_store_explicit(&g_shellcore_flag_stop_requested, false,
+                        memory_order_relaxed);
   g_shellcore_flag_start_ready = false;
   g_shellcore_flag_start_success = false;
   close_shellcore_flags();
@@ -780,7 +788,8 @@ void sm_shellcore_flags_stop(void) {
   if (!g_shellcore_flag_thread_started)
     return;
 
-  g_shellcore_flag_stop_requested = 1;
+  atomic_store_explicit(&g_shellcore_flag_stop_requested, true,
+                        memory_order_relaxed);
   pthread_join(g_shellcore_flag_thread, NULL);
   g_shellcore_flag_thread_started = false;
   g_shellcore_flag_start_ready = false;

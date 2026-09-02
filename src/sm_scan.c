@@ -4,6 +4,7 @@
 #include "sm_scan_tree.h"
 #include "sm_types.h"
 #include "sm_game_cache.h"
+#include "sm_game_lifecycle.h"
 #include "sm_gameinfo.h"
 #include "sm_log.h"
 #include "sm_config_mount.h"
@@ -16,17 +17,21 @@
 #include "sm_stability.h"
 #include "sm_title_state.h"
 #include "sm_image_cache.h"
+#include "sm_image_index.h"
 #include "sm_image.h"
 #include "sm_install_queue.h"
 #include "sm_manual.h"
+#include "sm_shellcore_service.h"
 
 typedef struct {
   char discovered_param_roots[MAX_PENDING][MAX_PATH];
+  char found_titles[MAX_PENDING][MAX_TITLE_ID];
   char checked_appmeta_titles[MAX_PENDING][MAX_TITLE_ID];
   char blocked_ppsa_uninstall_titles[MAX_PENDING][MAX_TITLE_ID];
   bool checked_appmeta_present[MAX_PENDING];
   int checked_appmeta_count;
   int blocked_ppsa_uninstall_count;
+  int found_title_count;
 } scan_workspace_t;
 
 // Reuse the largest transient scan buffer instead of placing ~512 KiB of path
@@ -36,6 +41,49 @@ static scan_workspace_t g_scan_workspace;
 static void reset_scan_workspace(void) {
   g_scan_workspace.checked_appmeta_count = 0;
   g_scan_workspace.blocked_ppsa_uninstall_count = 0;
+  g_scan_workspace.found_title_count = 0;
+}
+
+static void note_found_title(const char *title_id) {
+  if (!title_id || title_id[0] == '\0')
+    return;
+
+  for (int i = 0; i < g_scan_workspace.found_title_count; i++) {
+    if (strcmp(g_scan_workspace.found_titles[i], title_id) == 0)
+      return;
+  }
+  if (g_scan_workspace.found_title_count >= MAX_PENDING)
+    return;
+
+  int slot = g_scan_workspace.found_title_count++;
+  (void)strlcpy(g_scan_workspace.found_titles[slot], title_id,
+                sizeof(g_scan_workspace.found_titles[slot]));
+}
+
+static void note_found_indexed_title(const char *title_id, const void *ctx) {
+  const char *image_path = ctx;
+  note_found_title(title_id);
+
+  char runtime_path[MAX_PATH];
+  char linked_image[MAX_PATH];
+  if (!image_path ||
+      !read_mount_link(title_id, runtime_path, sizeof(runtime_path)) ||
+      !read_mount_image_link(title_id, linked_image, sizeof(linked_image)) ||
+      strcmp(linked_image, image_path) != 0) {
+    return;
+  }
+  cache_game_entry(runtime_path, title_id, "");
+}
+
+static bool mount_persistent_indexed_image(const char *image_path,
+                                           const char *image_name,
+                                           bool *unstable_found_out) {
+  bool image_unstable = false;
+  if (maybe_mount_image_file(image_path, image_name, &image_unstable))
+    return true;
+  if (image_unstable && unstable_found_out)
+    *unstable_found_out = true;
+  return false;
 }
 
 static bool blocked_ppsa_uninstall_requested(const char *title_id) {
@@ -233,6 +281,16 @@ static void notify_duplicate_scan_candidate(const char *title_id,
   notify_duplicate_title_once(title_id, ignored_path, existing_path);
 }
 
+static bool defer_full_candidate_batch(int candidate_count,
+                                       int max_candidates,
+                                       bool *incomplete_found_out) {
+  if (candidate_count < max_candidates)
+    return false;
+  if (incomplete_found_out)
+    *incomplete_found_out = true;
+  return true;
+}
+
 static existing_directory_result_t handle_existing_directory_candidate(
     const char *full_path, const scan_app_db_context_t *app_db,
     const directory_candidate_info_t *info,
@@ -267,9 +325,11 @@ static existing_directory_result_t handle_existing_directory_candidate(
   link_matches_source = installed && link_matches_source;
   bool source_valid = false;
   if (link_matches_source) {
-    source_valid = is_data_mounted(info->title_id);
-    if (!source_valid && mount_title_nullfs(info->title_id, full_path))
-      source_valid = is_data_mounted(info->title_id);
+    char eboot_path[MAX_PATH];
+    int written = snprintf(eboot_path, sizeof(eboot_path), "%s/eboot.bin",
+                           full_path);
+    source_valid = written > 0 && (size_t)written < sizeof(eboot_path) &&
+                   path_exists(eboot_path);
   }
 
   if (source_valid && appmeta_present) {
@@ -327,9 +387,10 @@ static bool enqueue_directory_candidate(
     return true;
   }
 
-  if (*candidate_count >= max_candidates) {
-    log_debug("  [SKIP] candidate queue full (%d): %s (%s)", max_candidates,
-              info->title_name, info->title_id);
+  if (defer_full_candidate_batch(*candidate_count, max_candidates,
+                                 unstable_found_out)) {
+    log_debug("  [SKIP] candidate queue full (%d), deferring: %s (%s)",
+              max_candidates, info->title_name, info->title_id);
     return true;
   }
 
@@ -364,6 +425,15 @@ static bool try_collect_candidate_for_directory(
     return true;
   if (probe_result == DIRECTORY_CANDIDATE_DESCEND)
     return false;
+
+  note_found_title(info.title_id);
+
+  note_game_cache_source_seen(full_path, info.title_id, info.title_name);
+
+  if (!sm_image_index_record_game(full_path, info.title_id) &&
+      unstable_found_out) {
+    *unstable_found_out = true;
+  }
 
   int duplicate_candidate_index = find_scan_candidate_index_by_title_id(
       candidates, *candidate_count, info.title_id);
@@ -449,6 +519,10 @@ static sm_scan_tree_dir_visit_t collect_candidate_directory_visit(
     return SM_SCAN_TREE_DIR_DESCEND;
 
   collect_candidates_walk_ctx_t *ctx = (collect_candidates_walk_ctx_t *)ctx_ptr;
+  if (defer_full_candidate_batch(*ctx->candidate_count, ctx->max_candidates,
+                                 ctx->unstable_found_out)) {
+    return SM_SCAN_TREE_DIR_ABORT;
+  }
   if (try_collect_candidate_for_directory(
           dir_path, ctx->candidates, ctx->max_candidates, ctx->candidate_count,
           ctx->app_db, ctx->discovered_param_roots,
@@ -467,17 +541,48 @@ static bool collect_candidate_image_visit(const char *image_path,
   (void)depth_from_root;
 
   collect_candidates_walk_ctx_t *ctx = (collect_candidates_walk_ctx_t *)ctx_ptr;
-  if (!maybe_mount_image_file(image_path, image_name, ctx->unstable_found_out))
+  if (defer_full_candidate_batch(*ctx->candidate_count, ctx->max_candidates,
+                                 ctx->unstable_found_out)) {
+    return false;
+  }
+  struct stat image_st;
+  if (stat(image_path, &image_st) != 0)
+    return true;
+  bool indexed_image = !is_under_image_mount_base(image_path);
+  bool index_ready =
+      indexed_image && sm_image_index_visit_ready_titles(
+                           image_path, &image_st, ctx->app_db->titles,
+                           ctx->app_db->titles_ready,
+                           note_found_indexed_title, image_path);
+  if (index_ready && !runtime_config()->persistent_image_mounts)
     return true;
 
-  if (ctx->manual_source_path && is_pfsc_image_mount_base_or_child(image_path)) {
-    char mount_point[MAX_PATH];
-    get_image_mount_point_for_source(image_path, mount_point);
-    collect_scan_candidates_from_manual_root(
-        mount_point, ctx->manual_source_path, ctx->candidates,
-        ctx->max_candidates, ctx->candidate_count, ctx->app_db,
-        ctx->discovered_param_roots, ctx->discovered_param_root_count,
-        ctx->unstable_found_out);
+  if (index_ready) {
+    (void)mount_persistent_indexed_image(image_path, image_name,
+                                         ctx->unstable_found_out);
+    return true;
+  }
+  bool image_unstable = false;
+  if (!maybe_mount_image_file(image_path, image_name, &image_unstable)) {
+    if (image_unstable && ctx->unstable_found_out)
+      *ctx->unstable_found_out = true;
+    return true;
+  }
+  if (indexed_image)
+    sm_image_index_begin_scan(image_path, &image_st);
+
+  char mount_point[MAX_PATH];
+  get_image_mount_point_for_source(image_path, mount_point);
+  collect_scan_candidates_from_manual_root(
+      mount_point, ctx->manual_source_path, ctx->candidates,
+      ctx->max_candidates, ctx->candidate_count, ctx->app_db,
+      ctx->discovered_param_roots, ctx->discovered_param_root_count,
+      &image_unstable);
+  if (image_unstable && ctx->unstable_found_out)
+    *ctx->unstable_found_out = true;
+  if (indexed_image && !image_unstable && !should_stop_requested() &&
+      !runtime_sleep_mode_active()) {
+    sm_image_index_complete_scan(image_path);
   }
   return true;
 }
@@ -534,6 +639,10 @@ static void collect_scan_candidates_from_manual_path(
     int *discovered_param_root_count, bool *unstable_found_out) {
   if (should_stop_requested() || runtime_sleep_mode_active())
     return;
+  if (defer_full_candidate_batch(*candidate_count, max_candidates,
+                                 unstable_found_out)) {
+    return;
+  }
 
   struct stat st;
   if (stat(manual_path, &st) != 0) {
@@ -546,15 +655,48 @@ static void collect_scan_candidates_from_manual_path(
   const char *name = get_filename_component(manual_path);
   if (S_ISREG(st.st_mode) &&
       is_supported_image_file_path(manual_path, name)) {
-    if (!maybe_mount_image_file(manual_path, name, unstable_found_out))
+    bool index_ready = sm_image_index_visit_ready_titles(
+        manual_path, &st, app_db->titles, app_db->titles_ready,
+        note_found_indexed_title, manual_path);
+    if (index_ready && !runtime_config()->persistent_image_mounts)
       return;
+
+    if (index_ready) {
+      if (!mount_persistent_indexed_image(manual_path, name,
+                                          unstable_found_out)) {
+        return;
+      }
+
+      char mount_point[MAX_PATH];
+      get_image_mount_point_for_source(manual_path, mount_point);
+      if (is_pfsc_image_mount_base_or_child(mount_point)) {
+        collect_scan_candidates_from_manual_root(
+            mount_point, manual_path, candidates, max_candidates,
+            candidate_count, app_db, discovered_param_roots,
+            discovered_param_root_count, unstable_found_out);
+      }
+      return;
+    }
+    bool image_unstable = false;
+    if (!maybe_mount_image_file(manual_path, name, &image_unstable)) {
+      if (image_unstable && unstable_found_out)
+        *unstable_found_out = true;
+      return;
+    }
+    sm_image_index_begin_scan(manual_path, &st);
 
     char mount_point[MAX_PATH];
     get_image_mount_point_for_source(manual_path, mount_point);
     collect_scan_candidates_from_manual_root(
         mount_point, manual_path, candidates, max_candidates, candidate_count,
         app_db, discovered_param_roots, discovered_param_root_count,
-        unstable_found_out);
+        &image_unstable);
+    if (image_unstable && unstable_found_out)
+      *unstable_found_out = true;
+    if (!image_unstable && !should_stop_requested() &&
+        !runtime_sleep_mode_active()) {
+      sm_image_index_complete_scan(manual_path);
+    }
     return;
   }
 
@@ -621,9 +763,9 @@ static bool backport_path_is_dir(const char *backport_path) {
          S_ISDIR(st.st_mode);
 }
 
-static bool resolve_backport_path(const char *title_id,
-                                  const char *owning_scan_path,
-                                  char backport_path[MAX_PATH]) {
+bool resolve_backport_path_for_title(const char *title_id,
+                                     const char *owning_scan_path,
+                                     char backport_path[MAX_PATH]) {
   if (!title_id || title_id[0] == '\0')
     return false;
 
@@ -653,43 +795,40 @@ static bool resolve_backport_path(const char *title_id,
   return false;
 }
 
-typedef struct {
-  bool *unstable_found_out;
-} backport_overlay_ctx_t;
-
-static bool mount_backport_overlay_for_cached_game(const char *source_path,
-                                                   const char *title_id,
-                                                   const char *title_name,
-                                                   const char *owning_scan_root,
-                                                   void *ctx_ptr) {
-  (void)title_name;
-
+bool mount_backport_overlay_for_title(const char *source_path,
+                                      const char *title_id,
+                                      const char *owning_scan_root,
+                                      bool *unstable_found_out) {
   if (should_stop_requested() || runtime_sleep_mode_active())
     return false;
 
-  backport_overlay_ctx_t *ctx = (backport_overlay_ctx_t *)ctx_ptr;
   char backport_path[MAX_PATH];
-  if (!resolve_backport_path(title_id, owning_scan_root, backport_path)) {
+  if (!resolve_backport_path_for_title(title_id, owning_scan_root,
+                                       backport_path)) {
     return true;
   }
   if (is_backport_mount_blocked(backport_path))
-    return true;
+    return false;
 
   bool overlay_active = false;
   if (!reconcile_title_backport_mount(title_id, source_path, backport_path,
-                                      &overlay_active) ||
-      overlay_active) {
+                                      &overlay_active)) {
+    return false;
+  }
+  if (overlay_active) {
     return true;
   }
   if (!wait_for_stability_fast(backport_path, "BKP")) {
-    if (ctx->unstable_found_out)
-      *ctx->unstable_found_out = true;
-    return true;
+    if (unstable_found_out)
+      *unstable_found_out = true;
+    return false;
   }
   overlay_active = false;
   if (!reconcile_title_backport_mount(title_id, source_path, backport_path,
-                                      &overlay_active) ||
-      overlay_active) {
+                                      &overlay_active)) {
+    return false;
+  }
+  if (overlay_active) {
     return true;
   }
 
@@ -698,35 +837,58 @@ static bool mount_backport_overlay_for_cached_game(const char *source_path,
            title_id);
   if (!mount_backport_overlay(system_ex_path, backport_path, title_id)) {
     note_backport_mount_failure(backport_path);
-    return true;
+    return false;
   }
   clear_backport_mount_failure(backport_path);
   return true;
 }
 
-void mount_backport_overlays(bool *unstable_found_out) {
-  backport_overlay_ctx_t ctx = {
-      .unstable_found_out = unstable_found_out,
-  };
-  for_each_cached_game_entry(NULL, mount_backport_overlay_for_cached_game, &ctx);
+bool release_scan_runtime_mounts(void) {
+  if (runtime_sleep_mode_active())
+    return false;
+  if (sm_game_lifecycle_has_active_game() ||
+      sm_shellcore_service_has_prepared_mount()) {
+    return true;
+  }
+  runtime_mount_state_lock();
+  if (sm_game_lifecycle_has_active_game() ||
+      sm_shellcore_service_has_prepared_mount()) {
+    runtime_mount_state_unlock();
+    return true;
+  }
+  if (!unmount_all_title_runtime_layers()) {
+    runtime_mount_state_unlock();
+    return false;
+  }
+  bool released = runtime_config()->persistent_image_mounts ||
+                  release_runtime_image_mounts();
+  runtime_mount_state_unlock();
+  return released;
 }
 
 // --- Unified Scan Pass (images + game candidates) ---
 void cleanup_lost_sources_before_scan(void) {
-  // 1) Drop stale game cache entries for deleted sources.
+  // 1) Validate the persistent image index before any cache consumer runs.
+  sm_image_index_prune();
+  // 2) Drop stale game cache entries for deleted sources.
   prune_game_cache();
-  // 2) Drop stale/broken mount links and unmount stale /system_ex stacks.
-  cleanup_mount_links(NULL, true);
-  // 3) Unmount stale image mounts for deleted image files.
+  // 3) Recover or remove stale image mounts before validating their title links.
   cleanup_stale_image_mounts();
-  // 4) Drop stale path-state entries.
+  // 4) Drop stale/broken mount links and unmount stale /system_ex stacks.
+  runtime_mount_state_lock();
+  cleanup_mount_links(NULL, true);
+  runtime_mount_state_unlock();
+  // 5) Drop stale path-state entries.
   prune_path_state();
 }
 
 void cleanup_lost_sources_for_scan_root(const char *scan_root) {
+  sm_image_index_prune();
   prune_game_cache_for_root(scan_root);
-  cleanup_mount_links(scan_root, true);
   cleanup_stale_image_mounts_for_root(scan_root);
+  runtime_mount_state_lock();
+  cleanup_mount_links(scan_root, true);
+  runtime_mount_state_unlock();
   prune_path_state_for_root(scan_root);
 }
 
@@ -847,7 +1009,8 @@ int collect_scan_candidates_for_scan_root(const char *scan_root,
                                     unstable_found_out);
 
   if (total_found_out)
-    *total_found_out = discovered_param_root_count;
+    *total_found_out = g_scan_workspace.found_title_count;
+  sm_image_index_flush();
   free_app_db_title_list(&blocked_ppsa_titles);
   free_app_db_title_list(&app_db_titles);
   return candidate_count;
@@ -896,7 +1059,8 @@ int collect_scan_candidates(scan_candidate_t *candidates, int max_candidates,
                                 blocked_ppsa_titles_ready);
 
   if (total_found_out)
-    *total_found_out = discovered_param_root_count;
+    *total_found_out = g_scan_workspace.found_title_count;
+  sm_image_index_flush();
   free_app_db_title_list(&blocked_ppsa_titles);
   free_app_db_title_list(&app_db_titles);
   return candidate_count;

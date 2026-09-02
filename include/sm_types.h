@@ -103,29 +103,60 @@ typedef enum {
   ATTACH_BACKEND_MD,
 } attach_backend_t;
 
+typedef enum {
+  ATTACHED_DEVICE_RELEASED = 0,
+  ATTACHED_DEVICE_ATTACHING,
+  ATTACHED_DEVICE_MOUNTED,
+  ATTACHED_DEVICE_DETACH_REQUESTED,
+} attached_device_state_t;
+
+typedef struct {
+  // A detach ioctl was accepted for this specific device instance. Once set,
+  // the same unit number must not receive another detach request because the
+  // kernel may already have reused it for a different application.
+  bool requested;
+  bool node_identity_valid;
+  uint64_t node_device;
+  uint64_t node_inode;
+  uint64_t node_rdev;
+} attached_unit_detach_state_t;
+
 typedef struct runtime_config {
+  bool api_enabled;
   bool debug_enabled;
   bool quiet_mode;
   bool mount_read_only;
   bool force_mount;
+  bool persistent_image_mounts;
   bool app_install_all_enabled;
-  bool app_install_all_forced;
+  bool auto_remove_missing_games;
+  bool auto_remove_games_with_dlc;
   bool backport_fakelib_enabled;
   bool global_fakelib_enabled;
-  bool global_fakelib_mount_first;
+  bool global_fakelib_game_priority;
+  bool update_emulators_enabled;
+  bool auto_update_ampr_enabled;
   bool kstuff_game_auto_toggle;
   bool kstuff_crash_detection_enabled;
   bool legacy_recursive_scan_forced;
+  char api_bind_address[MAX_API_BIND_ADDRESS];
+  uint32_t api_port;
   char global_fakelib_path[MAX_PATH];
+  char emulators_path[MAX_PATH];
+  char ampr_update_url[MAX_PATH];
   uint32_t global_fakelib_exclude_title_count;
   char global_fakelib_exclude_title_ids[MAX_FAKELIB_EXCLUDE_RULES][MAX_TITLE_ID];
   uint32_t scan_depth;
   uint32_t scan_interval_us;
   uint32_t stability_wait_seconds;
+  uint32_t auto_remove_missing_delay_seconds;
   uint32_t kstuff_pause_delay_image_seconds;
   uint32_t kstuff_pause_delay_direct_seconds;
+  uint32_t fan_target_temperature_c;
+  int32_t language_id;
   attach_backend_t exfat_backend;
   attach_backend_t ufs_backend;
+  bool nested_pfs_index_cache_enabled;
   uint32_t lvd_sector_exfat;
   uint32_t lvd_sector_ufs;
   uint32_t lvd_sector_pfs;
