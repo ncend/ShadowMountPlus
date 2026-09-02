@@ -25,8 +25,15 @@ jobs:
 
       - name: Add Upstream Remote
         run: |
-          git remote add upstream https://github.com/ncend/ShadowMountPlus.git || true
-          git fetch upstream
+          git remote add upstream https://github.com/drakmor/ShadowMountPlus.git || true
+          git fetch upstream --tags
+
+      - name: Get Latest Upstream Tag
+        id: upstream_tag
+        run: |
+          LATEST=$(git ls-remote --tags upstream | awk '{print $2}' | sed 's|refs/tags/||' | grep -E '^[0-9]+\.' | sort -V | tail -1)
+          echo "latest_tag=$LATEST" >> $GITHUB_OUTPUT
+          echo "Latest upstream tag: $LATEST"
 
       - name: Check for Changes
         id: changes
@@ -48,7 +55,10 @@ jobs:
           git merge upstream/main --no-edit -m "chore: sync from upstream [skip ci]"
           git push origin main
 
-      - name: Trigger Build
-        if: steps.changes.outputs.changed == 'true'
+      - name: Create -nc Tag
+        if: steps.changes.outputs.changed == 'true' && steps.upstream_tag.outputs.latest_tag != ''
         run: |
-          echo "Build will be triggered by push to main"
+          NC_TAG="${{ steps.upstream_tag.outputs.latest_tag }}-nc"
+          git tag "$NC_TAG"
+          git push origin "$NC_TAG"
+          echo "Created and pushed tag: $NC_TAG"
