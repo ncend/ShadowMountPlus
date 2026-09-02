@@ -1,0 +1,54 @@
+name: Auto Sync and Build
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add Upstream Remote
+        run: |
+          git remote add upstream https://github.com/ncend/ShadowMountPlus.git || true
+          git fetch upstream
+
+      - name: Check for Changes
+        id: changes
+        run: |
+          LOCAL=$(git rev-parse HEAD)
+          UPSTREAM=$(git rev-parse upstream/main)
+          
+          if [ "$LOCAL" != "$UPSTREAM" ]; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+            echo "Upstream has new commits. Local: $LOCAL, Upstream: $UPSTREAM"
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+            echo "Already up to date"
+          fi
+
+      - name: Sync and Push
+        if: steps.changes.outputs.changed == 'true'
+        run: |
+          git merge upstream/main --no-edit -m "chore: sync from upstream [skip ci]"
+          git push origin main
+
+      - name: Trigger Build
+        if: steps.changes.outputs.changed == 'true'
+        run: |
+          echo "Build will be triggered by push to main"
