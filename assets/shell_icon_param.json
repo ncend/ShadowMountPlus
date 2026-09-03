@@ -1,9 +1,9 @@
 {
-  "applicationCategoryType": 66048,
+  "applicationCategoryType": 66560,
   "titleId": "FAKE10101",
   "deeplinkUri": "http://127.0.0.1:10101/",
   "localizedParameters": {
     "defaultLanguage": "en-US",
-    "en-US": { "titleName": "Shadow Mount+" }   
+    "en-US": { "titleName": "Shadow Mount+" }
   }
 }
