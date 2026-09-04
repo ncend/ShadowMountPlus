@@ -35,6 +35,22 @@ jobs:
           echo "latest_tag=$LATEST" >> $GITHUB_OUTPUT
           echo "Latest upstream tag: $LATEST"
 
+      - name: Check if -nc tag already exists
+        id: nc_tag_check
+        run: |
+          NC_TAG="${{ steps.upstream_tag.outputs.latest_tag }}-nc"
+          if git rev-parse "$NC_TAG" >/dev/null 2>&1; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "Tag $NC_TAG already exists locally"
+          elif git ls-remote --tags origin | grep -q "refs/tags/$NC_TAG$"; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "Tag $NC_TAG already exists on remote"
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "Tag $NC_TAG does not exist"
+          fi
+          echo "nc_tag=$NC_TAG" >> $GITHUB_OUTPUT
+
       - name: Check for Changes
         id: changes
         run: |
@@ -56,9 +72,19 @@ jobs:
           git push origin main
 
       - name: Create -nc Tag
-        if: steps.changes.outputs.changed == 'true' && steps.upstream_tag.outputs.latest_tag != ''
+        if: steps.changes.outputs.changed == 'true' && steps.upstream_tag.outputs.latest_tag != '' && steps.nc_tag_check.outputs.exists == 'false'
         run: |
-          NC_TAG="${{ steps.upstream_tag.outputs.latest_tag }}-nc"
+          NC_TAG="${{ steps.nc_tag_check.outputs.nc_tag }}"
           git tag "$NC_TAG"
           git push origin "$NC_TAG"
-          echo "Created and pushed tag: $NC_TAG"
+          echo "Created and pushed new tag: $NC_TAG"
+
+      - name: Force update -nc Tag (new commits on same upstream tag)
+        if: steps.changes.outputs.changed == 'true' && steps.upstream_tag.outputs.latest_tag != '' && steps.nc_tag_check.outputs.exists == 'true'
+        run: |
+          NC_TAG="${{ steps.nc_tag_check.outputs.nc_tag }}"
+          # Create an empty commit to force tag update
+          git commit --allow-empty -m "chore: rebuild for ${{ steps.upstream_tag.outputs.latest_tag }}-nc [skip ci]"
+          git tag -f "$NC_TAG"
+          git push origin "$NC_TAG" --force
+          echo "Force updated tag: $NC_TAG with new commit"
